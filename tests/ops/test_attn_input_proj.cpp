@@ -409,7 +409,7 @@ int run_fp8_target() {
     return failures;
 }
 
-int run_w8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
+int run_w8_target_case(DevicePackedWeight& parent, std::int32_t tokens, bool with_workspace) {
     constexpr std::int32_t kHidden      = 2048;
     constexpr std::int32_t kQRows       = 4096;
     constexpr std::int32_t kKvRows      = 512;
@@ -426,10 +426,21 @@ int run_w8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    if (with_workspace) {
+        // The workspace overload is the one the 35B-A3B runtime calls; on Volta it takes the
+        // dequantize + CUTLASS route from kW8CutlassMinCols columns on.
+        const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
+            QType::W8G32_F16S, 9216, kHidden, ops::LinearPolicy::A16Only, tokens, tokens);
+        DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+        ops::attn_input_proj(x, parent.view(), q, g, k, v, ops::LinearPolicy::A16Only, workspace,
+                             nullptr);
+    } else {
+        ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    }
     cuda_synchronize();
 
-    const std::string suffix = " W8 target A16 T=" + std::to_string(tokens);
+    const std::string suffix = std::string(" W8 target A16") + (with_workspace ? " workspace" : "") +
+                               " T=" + std::to_string(tokens);
     int failures             = 0;
     failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
                               tokens);
@@ -450,7 +461,10 @@ int run_w8_target() {
         quantized_weight::make_patterned_weight(QType::W8G32_F16S, 9216, kHidden, 211U));
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 17, 48, 64, 65, 129}) {
-        failures += run_w8_target_case(parent, tokens);
+        failures += run_w8_target_case(parent, tokens, false);
+    }
+    for (const std::int32_t tokens : {17, 63, 64, 65, 129, 1000}) {
+        failures += run_w8_target_case(parent, tokens, true);
     }
     return failures;
 }

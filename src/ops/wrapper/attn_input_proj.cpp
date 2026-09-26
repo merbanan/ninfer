@@ -6,6 +6,7 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/w8/w8_cutlass_sm70.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
@@ -167,6 +168,20 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_w8_rowsplit(weight, kRows, 2048, "query/key/gate/value weight");
+#ifdef NINFER_VOLTA_BUILD
+    if (workspace != nullptr && cols >= detail::kW8CutlassMinCols && 
+        detail::w8_cutlass_sm70_fits(*workspace, kRows, kHidden, cols)) {
+        // Parent rows: query [0, 4096), key [4096, 4608), gate [4608, 8704), value [8704, 9216).
+        const detail::W8CutlassSegment segments[] = {
+            {0, kQRows, q.data, kQRows},
+            {kQRows, kKvRows, k.data, kKvRows},
+            {kQRows + kKvRows, kQRows, gate.data, kQRows},
+            {2 * kQRows + kKvRows, kKvRows, v.data, kKvRows},
+        };
+        detail::w8_cutlass_sm70_run(x, weight, segments, /*accumulate=*/false, *workspace, stream);
+        return;
+    }
+#endif
     detail::w8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
 }
 
@@ -208,6 +223,11 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             {input_rows, 4096, 512, parent_rows, input_rows, min_tokens});
         (void)detail::w8_attn_input_resolve_plan(
             {input_rows, 4096, 512, parent_rows, input_rows, max_tokens});
+#ifdef NINFER_VOLTA_BUILD
+        if (max_tokens >= detail::kW8CutlassMinCols) {
+            return detail::w8_cutlass_sm70_workspace_bytes(parent_rows, input_rows, max_tokens);
+        }
+#endif
         return 0;
     case QType::Q4G64_F16S:
     case QType::Q5G64_F16S:

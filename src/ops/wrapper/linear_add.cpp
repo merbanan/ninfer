@@ -9,6 +9,7 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
+#include "ops/linear/w8/w8_cutlass_sm70.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -99,6 +100,11 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         }
         (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
         (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
+#ifdef NINFER_VOLTA_BUILD
+        if (max_tokens >= detail::kW8CutlassMinCols) {
+            return detail::w8_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens);
+        }
+#endif
         return 0;
     }
     if (qtype == QType::Q5G64_F16S) {
@@ -196,6 +202,16 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument(
                 "linear_add: W8 requires 16-byte x/residual/code/scale alignment");
         }
+#ifdef NINFER_VOLTA_BUILD
+        if (x.ne[1] >= detail::kW8CutlassMinCols && x.is_contiguous() &&
+            detail::w8_cutlass_sm70_fits(ws, w.n, w.k, x.ne[1])) {
+            const detail::W8CutlassSegment segment{
+                0, w.n, residual_out.data,
+                static_cast<std::int32_t>(residual_out.nb[1] / static_cast<std::int64_t>(sizeof(std::uint16_t)))};
+            detail::w8_cutlass_sm70_run(x, w, {&segment, 1}, /*accumulate=*/true, ws, stream);
+            return;
+        }
+#endif
         (void)ws;
         detail::w8_linear_add_dispatch(x, w, residual_out, stream);
         return;

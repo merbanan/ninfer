@@ -12,6 +12,7 @@
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/w8/w8_rowsplit_storage.cuh"
+#include "ops/linear/w8/w8_launch.h"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
@@ -19,6 +20,7 @@
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include <cuda_bf16.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1783,6 +1785,18 @@ __global__ void sparse_moe_prefill_swiglu_kernel(const __nv_bfloat16* __restrict
     activation[i] = __float2bfloat16(g / (1.0f + __expf(-g)) * u);
 }
 
+// destination += routed_sum + shared_scale[col] * shared (the SIMT shared-down epilogue).
+__global__ void sparse_moe_prefill_shared_combine_kernel(const __nv_bfloat16* __restrict__ shared,
+                                                         const float* __restrict__ routed_sum,
+                                                         const float* __restrict__ shared_scale,
+                                                         __nv_bfloat16* __restrict__ destination, int tokens) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<std::int64_t>(tokens) * kHidden) { return; }
+    const std::int64_t col = i / kHidden;
+    destination[i] = __float2bfloat16_rn(__bfloat162float(destination[i]) + routed_sum[i] +
+                                         shared_scale[col] * __bfloat162float(shared[i]));
+}
+
 bool prefill_mma_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_MOE_PREFILL_MMA");
@@ -1791,6 +1805,51 @@ bool prefill_mma_enabled() {
     return enabled;
 }
 #endif // NINFER_VOLTA_BUILD
+
+// NINFER_MOE_STAGE_TIMING: per-stage device time of prefill calls, printed at exit.
+struct PrefillStageTimer {
+    static constexpr int kStages = 10;
+    static inline const char* kNames[kStages] = {"start", "router", "select", "resolve+scan", "gather",
+                                                 "gate_up", "shared_gate_up", "down", "reduce", "shared_down"};
+    static inline double totals[kStages] = {};
+    static bool enabled() {
+        static const bool on = [] {
+            if (std::getenv("NINFER_MOE_STAGE_TIMING") == nullptr) { return false; }
+            std::atexit([] {
+                double sum = 0;
+                for (int i = 1; i < kStages; ++i) { sum += totals[i]; }
+                for (int i = 1; i < kStages; ++i) {
+                    std::fprintf(stderr, "[moe prefill stage] %-15s %8.3f s (%4.1f%%)\n", kNames[i], totals[i],
+                                 sum > 0 ? 100.0 * totals[i] / sum : 0.0);
+                }
+            });
+            return true;
+        }();
+        return on;
+    }
+    explicit PrefillStageTimer(cudaStream_t s) : stream(s), on(enabled()) {
+        if (on) { for (auto& e : events) { CUDA_CHECK(cudaEventCreate(&e)); } }
+    }
+    ~PrefillStageTimer() {
+        if (!on) { return; }
+        (void)cudaStreamSynchronize(stream);
+        for (auto& e : events) { (void)cudaEventDestroy(e); }
+    }
+    void mark(int stage) {
+        if (!on) { return; }
+        CUDA_CHECK(cudaEventRecord(events[stage], stream));
+        if (stage == kStages - 1) {
+            CUDA_CHECK(cudaEventSynchronize(events[stage]));
+            for (int i = 1; i < kStages; ++i) {
+                float ms = 0;
+                if (cudaEventElapsedTime(&ms, events[i - 1], events[i]) == cudaSuccess) { totals[i] += ms / 1e3; }
+            }
+        }
+    }
+    cudaStream_t stream;
+    bool on;
+    cudaEvent_t events[kStages] = {};
+};
 
 void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
@@ -1840,7 +1899,9 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
     auto* routed_activation = static_cast<__nv_bfloat16*>(workspace.routed_storage.data);
     auto* routed_sum        = static_cast<float*>(workspace.routed_sum.data);
 
+    PrefillStageTimer stage_timer(stream);
     for (std::int32_t token0 = 0; token0 < plan.tokens; token0 += plan.slice_tokens) {
+        stage_timer.mark(0);
         const std::int32_t tokens =
             std::min(plan.slice_tokens, static_cast<std::int32_t>(plan.tokens - token0));
         const Tensor input_slice = x.slice(1, token0, tokens);
@@ -1871,10 +1932,12 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                                                             tokens);
 #endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
+        stage_timer.mark(1);
 
         sparse_moe_prefill_select_count_kernel<<<route_tiles, kRouterThreads, 0, stream>>>(
             scores, ids, alpha, shared_scale, local_rank, tile_counts, tokens);
         CUDA_CHECK(cudaGetLastError());
+        stage_timer.mark(2);
         if (residency != nullptr) {
             resolve_sparse_moe_residency(*residency, ids, assignments, false, bank_of_expert, stream);
         }
@@ -1894,6 +1957,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             tile_counts, tile_bases, offsets, route_job_experts, route_job_columns, route_job_count,
             route_tiles, route_job_bn, tokens, adaptive);
         CUDA_CHECK(cudaGetLastError());
+        stage_timer.mark(3);
 
 #ifdef NINFER_VOLTA_BUILD
         if (adaptive) {
@@ -1935,6 +1999,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         }
 #endif
         CUDA_CHECK(cudaGetLastError());
+        stage_timer.mark(4);
 
 #ifdef NINFER_VOLTA_BUILD
         // The grouped kernels take the same device-side job list and the same
@@ -1943,6 +2008,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         const int tiles_per_job  = route_job_bn / kMmaTile;
         const bool mma           = prefill_mma_enabled() && !adaptive &&
                                    weights.routed_gate_up.qtype == QType::Q4G64_F16S;
+        const bool shared_mma    = prefill_mma_enabled() && !adaptive;
         if (mma) {
             auto* gate_up_out = static_cast<__nv_bfloat16*>(workspace.routed_gate_up.data);
             sparse_moe_prefill_q4_gate_up_mma_kernel<<<dim3(2 * kIntermediate / Q4VoltaMmaSchedule::kRowsPerCta, 1,
@@ -1998,6 +2064,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         }
 #endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
+        stage_timer.mark(5);
 
         const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
                                     (tokens + kExpertBN - 1) / kExpertBN);
@@ -2005,7 +2072,18 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         {
             constexpr int kSimtBN = 64;
             const dim3 grid(kIntermediate / kSimtRowsPerCta, (tokens + kSimtBN - 1) / kSimtBN);
-            if (adaptive) {
+            if (shared_mma) {
+                // Tensor-core W8 GEMM into the routed gate/up scratch (free again after the routed
+                // SwiGLU), then SwiGLU. The SIMT form decoded every weight tile once per 64 tokens.
+                auto* scratch = static_cast<__nv_bfloat16*>(workspace.routed_gate_up.data);
+                launch_w8_volta_mma_raw(shared_gate_codes, shared_gate_scales, input, scratch,
+                                        2 * kIntermediate, kHidden, tokens,
+                                        weights.shared_gate_up.padded_shape[1] / W8RowSplitStorage::kGroupK,
+                                        2 * kIntermediate, stream);
+                const std::int64_t elements = static_cast<std::int64_t>(tokens) * kIntermediate;
+                sparse_moe_prefill_swiglu_kernel<<<static_cast<unsigned>((elements + 255) / 256), 256, 0,
+                                                   stream>>>(scratch, shared_activation, tokens);
+            } else if (adaptive) {
                 sparse_moe_prefill_w8_shared_gate_up_simt_kernel<kSimtBN, true>
                     <<<grid, kSimtThreads, 0, stream>>>(input, shared_gate_codes,
                                                         shared_gate_scales, shared_activation,
@@ -2031,6 +2109,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         }
 #endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
+        stage_timer.mark(6);
 
 #ifdef NINFER_VOLTA_BUILD
         switch (weights.routed_down.qtype) {
@@ -2119,6 +2198,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         }
 #endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
+        stage_timer.mark(7);
 
         if (adaptive) {
             sparse_moe_prefill_reduce_kernel<true><<<tokens, kExpertThreads, 0, stream>>>(
@@ -2128,13 +2208,24 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                 grouped_io, packed_index, alpha, routed_sum, nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
+        stage_timer.mark(8);
 
         const dim3 shared_down_grid(kHidden / kExpertBM, (tokens + kExpertBN - 1) / kExpertBN);
 #ifdef NINFER_VOLTA_BUILD
         {
             constexpr int kSimtBN = 64;
             const dim3 grid(kHidden / kSimtRowsPerCta, (tokens + kSimtBN - 1) / kSimtBN);
-            if (adaptive) {
+            if (shared_mma) {
+                auto* scratch = static_cast<__nv_bfloat16*>(workspace.routed_gate_up.data);
+                launch_w8_volta_mma_raw(shared_down_codes, shared_down_scales, shared_activation, scratch,
+                                        kHidden, kIntermediate, tokens,
+                                        weights.shared_down.padded_shape[1] / W8RowSplitStorage::kGroupK, kHidden,
+                                        stream);
+                const std::int64_t elements = static_cast<std::int64_t>(tokens) * kHidden;
+                sparse_moe_prefill_shared_combine_kernel<<<static_cast<unsigned>((elements + 255) / 256), 256,
+                                                           0, stream>>>(scratch, routed_sum, shared_scale,
+                                                                        output, tokens);
+            } else if (adaptive) {
                 sparse_moe_prefill_w8_shared_down_simt_kernel<kSimtBN, true>
                     <<<grid, kSimtThreads, 0, stream>>>(shared_activation, shared_down_codes,
                                                         shared_down_scales, routed_sum,
@@ -2161,6 +2252,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         }
 #endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
+        stage_timer.mark(9);
     }
 }
 

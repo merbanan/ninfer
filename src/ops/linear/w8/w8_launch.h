@@ -15,6 +15,11 @@ using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 // fits the W8Launch signature, because the shapes it is selected for supply far more CTAs than
 // the machine holds resident and so need no split-K, and therefore no workspace.
 void launch_w8_volta_mma(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+// Same route over raw row-major BF16 activations [t, k] and output [t, out_ld] (SparseMoe prefill).
+void launch_w8_volta_mma_raw(const std::uint8_t* codes, const std::uint8_t* scales,
+                             const void* x_bf16, void* out_bf16, std::int32_t n, std::int32_t k,
+                             std::int32_t t, std::int32_t padded_groups, std::int32_t out_ld,
+                             cudaStream_t stream);
 [[nodiscard]] bool w8_volta_mma_supported(std::int32_t n, std::int32_t k,
                                           std::int32_t t) noexcept;
 

@@ -37,6 +37,18 @@ void launch_w8_volta_mma(const Tensor& x, const Weight& w, Tensor& out, cudaStre
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_w8_volta_mma_raw(const std::uint8_t* codes, const std::uint8_t* scales,
+                             const void* x_bf16, void* out_bf16, std::int32_t n, std::int32_t k,
+                             std::int32_t t, std::int32_t padded_groups, std::int32_t out_ld,
+                             cudaStream_t stream) {
+    const dim3 grid(static_cast<unsigned>((n + S::kRowsPerCta - 1) / S::kRowsPerCta),
+                    static_cast<unsigned>((t + S::kTTile - 1) / S::kTTile));
+    w8_volta_mma_gemm_kernel<<<grid, S::kThreads, 0, stream>>>(
+        codes, scales, static_cast<const __nv_bfloat16*>(x_bf16), static_cast<__nv_bfloat16*>(out_bf16), n,
+        k, t, padded_groups, out_ld);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 #endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail
