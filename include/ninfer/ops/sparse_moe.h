@@ -49,22 +49,34 @@ struct SparseMoeHints {
  * it needs on `stream`. Routing, tie-breaking, token grouping, and the result are exactly those
  * of the resident Op; only the bank each expert's rows are read from changes.
  */
+// Which selected experts acquire may leave cold (host-computed) for one call.
+enum class SparseMoeColdMode : std::uint8_t {
+    // Every selected expert must be mapped to a bank.
+    None,
+    // Decode and small-T calls: acquire may write -1 for an expert; the Op then calls
+    // cold_compute for the cold ones.
+    Decode,
+    // Prefill calls of at most prefill_cold_max_tokens columns: acquire may write -1 for an
+    // expert, and then itself writes the cold sum into host_cold_sum (from host_alpha and host_x,
+    // which the Op fills before calling), so that host work can overlap the uploads it orders.
+    Prefill,
+};
+
 struct SparseMoeExpertResidency {
     std::int32_t* host_ids            = nullptr; // pinned host storage, >= 8 * T entries
     std::int32_t* host_bank_of_expert = nullptr; // pinned host storage, 256 entries
     std::int32_t banks                = 0;
-    // cold_allowed is true only for calls that can take host-computed ("cold") experts; acquire
-    // may then leave a selected expert cold by writing -1 for it.
     std::function<void(std::span<const std::int32_t> selected_ids, std::int32_t* bank_of_expert,
-                       bool cold_allowed, cudaStream_t stream)>
+                       SparseMoeColdMode cold_mode, cudaStream_t stream)>
         acquire;
 
-    // Host-computed cold experts (decode and small-T calls; unused when cold_compute is empty).
-    // zero_bank is a bank whose weights are all zero: cold experts are read from it on the device,
-    // contributing nothing there. cold_compute receives the selected ids, their route weights, the
-    // BF16 input columns, and the bank table, and writes into cold_sum[column * 2048 + row] the sum
-    // of weight * expert(x) over the cold experts only; the Op adds it before the final rounding.
+    // Host-computed cold experts (unused when cold_compute is empty). zero_bank is a bank whose
+    // weights are all zero: cold experts are read from it on the device, contributing nothing
+    // there. cold_compute receives the selected ids, their route weights, the BF16 input columns,
+    // and the bank table, and writes into cold_sum[column * 2048 + row] the sum of
+    // weight * expert(x) over the cold experts only; the Op adds it before the final rounding.
     std::int32_t zero_bank   = -1;
+    std::int32_t prefill_cold_max_tokens = 0; // prefill calls up to this T use Prefill mode
     float* host_alpha        = nullptr; // pinned, >= 8 * T entries
     std::uint16_t* host_x    = nullptr; // pinned, >= 2048 * T entries
     float* host_cold_sum     = nullptr; // pinned, >= 2048 * T entries

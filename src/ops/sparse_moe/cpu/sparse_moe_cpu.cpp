@@ -14,7 +14,7 @@ namespace {
 constexpr int kHidden       = 2048;
 constexpr int kIntermediate = 512;
 constexpr int kGroup        = 64;
-constexpr int kMaxColumns   = 16; // columns one weight decode is reused across
+constexpr int kMaxColumns   = 16; // columns one weight decode is reused across (dot-product form)
 constexpr int kGateRowBlock = 64;
 constexpr int kDownRowBlock = 64;
 
@@ -176,6 +176,60 @@ __attribute__((target("avx2,fma,f16c"))) void avx2_rows(const Rows& m, int row_b
     }
 }
 
+// Multi-column form, GEMM-style, over a column tile transposed to xt[k][kTileColumns] (zero
+// padded): a 256-deep K block of it (16 KiB) stays in L1 while every row passes over it, and each
+// decoded weight is broadcast against NV vectors of 8 columns. R rows at a time keep R * NV
+// independent accumulators (8), which the FMA latency needs. Writes tile[row - row_begin][c].
+constexpr int kTileColumns = 16;
+constexpr int kKBlock      = 256;
+
+template <int NV, int R>
+__attribute__((target("avx2,fma,f16c"))) void avx2_tile_rows(const Rows& m, int row_begin, int row_end,
+                                                        const float* xt, float (*tile)[kTileColumns]) {
+    static_assert(NV * R == 8);
+    alignas(32) float w[R][kKBlock];
+    for (int k0 = 0; k0 < m.columns; k0 += kKBlock) {
+        const float* xk = xt + static_cast<std::size_t>(k0) * kTileColumns;
+        for (int row = row_begin; row < row_end; row += R) {
+            for (int r = 0; r < R; ++r) {
+                for (int g = 0; g < kKBlock / kGroup; ++g) {
+                    __m256 d[8];
+                    decode_group(m, static_cast<std::int64_t>(row + r) * m.groups() + k0 / kGroup + g, d);
+                    for (int i = 0; i < 8; ++i) { _mm256_store_ps(w[r] + g * kGroup + 8 * i, d[i]); }
+                }
+            }
+            __m256 a[R][NV];
+            for (int r = 0; r < R; ++r) {
+                for (int v = 0; v < NV; ++v) {
+                    a[r][v] = k0 == 0 ? _mm256_setzero_ps() : _mm256_load_ps(tile[row - row_begin + r] + 8 * v);
+                }
+            }
+#pragma GCC unroll 4
+            for (int k = 0; k < kKBlock; ++k) {
+                __m256 xv[NV];
+                for (int v = 0; v < NV; ++v) { xv[v] = _mm256_loadu_ps(xk + k * kTileColumns + 8 * v); }
+                for (int r = 0; r < R; ++r) {
+                    const __m256 b = _mm256_broadcast_ss(w[r] + k);
+                    for (int v = 0; v < NV; ++v) { a[r][v] = _mm256_fmadd_ps(b, xv[v], a[r][v]); }
+                }
+            }
+            for (int r = 0; r < R; ++r) {
+                for (int v = 0; v < NV; ++v) { _mm256_store_ps(tile[row - row_begin + r] + 8 * v, a[r][v]); }
+            }
+        }
+    }
+}
+
+// tile[row - row_begin][c] = row `row` of m times column c of xt, for ncols (3..16) columns.
+void tile_rows(const Rows& m, int row_begin, int row_end, const float* xt, int ncols,
+               float (*tile)[kTileColumns]) {
+    if (ncols <= 8) {
+        avx2_tile_rows<1, 8>(m, row_begin, row_end, xt, tile);
+    } else {
+        avx2_tile_rows<2, 4>(m, row_begin, row_end, xt, tile);
+    }
+}
+
 bool cpu_has_avx2() {
     static const bool has = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
                             __builtin_cpu_supports("f16c");
@@ -272,11 +326,33 @@ void SpinPool::run(std::size_t count, const std::function<void(std::size_t)>& ta
 
 void cold_experts(std::span<const ColdExpertWork> work, const std::uint16_t* x_bf16, std::int32_t tokens,
                   float* out, SpinPool& pool) {
-    std::fill(out, out + static_cast<std::size_t>(tokens) * kHidden, 0.0F);
-    if (work.empty()) { return; }
     // FP32 inputs, then per work item: gate/up outputs [columns][1024] and activations [columns][512].
-    std::vector<float> x(static_cast<std::size_t>(tokens) * kHidden);
-    for (std::size_t i = 0; i < x.size(); ++i) { x[i] = bf16_to_float(x_bf16[i]); }
+    // Prefill-size calls make zeroing and converting whole columns worth spreading over the pool.
+    // Scratch persists per calling thread: fresh multi-MiB vectors would be zeroed and page-faulted
+    // on every call, which measured as long as the arithmetic of a prefill-size call.
+    struct Scratch {
+        std::vector<float> x, gate_up, act, xt, act_t;
+    };
+    static thread_local Scratch scratch;
+    const auto sized = [](std::vector<float>& v, std::size_t n) -> std::vector<float>& {
+        if (v.size() < n) { v.resize(n); }
+        return v;
+    };
+    std::vector<float>& x = sized(scratch.x, work.empty() ? 0 : static_cast<std::size_t>(tokens) * kHidden);
+    const auto prepare = [&](std::size_t column) {
+        float* o = out + column * kHidden;
+        std::fill(o, o + kHidden, 0.0F);
+        if (work.empty()) { return; }
+        float* xf               = x.data() + column * kHidden;
+        const std::uint16_t* xb = x_bf16 + column * kHidden;
+        for (int i = 0; i < kHidden; ++i) { xf[i] = bf16_to_float(xb[i]); }
+    };
+    if (tokens >= 64) {
+        pool.run(static_cast<std::size_t>(tokens), prepare);
+    } else {
+        for (std::int32_t column = 0; column < tokens; ++column) { prepare(static_cast<std::size_t>(column)); }
+    }
+    if (work.empty()) { return; }
     std::vector<std::size_t> base(work.size() + 1, 0);
     for (std::size_t w = 0; w < work.size(); ++w) {
         if (work[w].columns.size() != work[w].weights.size() || work[w].columns.empty()) {
@@ -284,54 +360,119 @@ void cold_experts(std::span<const ColdExpertWork> work, const std::uint16_t* x_b
         }
         base[w + 1] = base[w] + work[w].columns.size();
     }
-    std::vector<float> gate_up(base.back() * 2 * kIntermediate);
-    std::vector<float> act(base.back() * kIntermediate);
+    // Column chunks of each work item; chunks of at least kMinTileColumns (on AVX2) go through the
+    // transposed-tile kernel, narrower ones through the per-column dot products.
+    constexpr int kMinTileColumns = 12; // measured crossover on a Ryzen 9 3900X
+    struct Chunk {
+        std::size_t w;
+        std::size_t c0;
+        int n;
+        std::int64_t tile; // index into the transposed tiles, or -1
+    };
+    std::vector<Chunk> chunks;
+    std::vector<std::vector<std::size_t>> chunks_of(work.size());
+    std::int64_t tiles = 0;
+    for (std::size_t w = 0; w < work.size(); ++w) {
+        for (std::size_t c0 = 0; c0 < work[w].columns.size(); c0 += kTileColumns) {
+            const int n = static_cast<int>(std::min<std::size_t>(kTileColumns, work[w].columns.size() - c0));
+            const bool tiled = cpu_has_avx2() && n >= kMinTileColumns;
+            chunks_of[w].push_back(chunks.size());
+            chunks.push_back({w, c0, n, tiled ? tiles++ : -1});
+        }
+    }
+    std::vector<float>& gate_up = sized(scratch.gate_up, base.back() * 2 * kIntermediate);
+    std::vector<float>& act     = sized(scratch.act, base.back() * kIntermediate);
+    std::vector<float>& xt      = sized(scratch.xt, static_cast<std::size_t>(tiles) * kHidden * kTileColumns);
+    std::vector<float>& act_t   = sized(scratch.act_t, static_cast<std::size_t>(tiles) * kIntermediate * kTileColumns);
+
+    pool.run(chunks.size(), [&](std::size_t index) {
+        const Chunk& chunk = chunks[index];
+        if (chunk.tile < 0) { return; }
+        const ColdExpertWork& e = work[chunk.w];
+        float* dst              = xt.data() + static_cast<std::size_t>(chunk.tile) * kHidden * kTileColumns;
+        for (int c = 0; c < kTileColumns; ++c) {
+            if (c >= chunk.n) {
+                for (int k = 0; k < kHidden; ++k) { dst[k * kTileColumns + c] = 0.0F; }
+                continue;
+            }
+            const float* src = x.data() + static_cast<std::size_t>(e.columns[chunk.c0 + c]) * kHidden;
+            for (int k = 0; k < kHidden; ++k) { dst[k * kTileColumns + c] = src[k]; }
+        }
+    });
 
     constexpr int kGateBlocks = 2 * kIntermediate / kGateRowBlock;
     pool.run(work.size() * kGateBlocks, [&](std::size_t task) {
         const std::size_t w     = task / kGateBlocks;
         const int block         = static_cast<int>(task % kGateBlocks);
+        const int row_begin     = block * kGateRowBlock;
         const ColdExpertWork& e = work[w];
         const Rows m{e.expert.gate_codes, nullptr, e.expert.gate_scales, kHidden, 4};
-        // Columns go through in chunks so one weight decode serves up to kMaxColumns of them.
-        for (std::size_t c0 = 0; c0 < e.columns.size(); c0 += kMaxColumns) {
-            const std::size_t n = std::min<std::size_t>(kMaxColumns, e.columns.size() - c0);
-            const float* xs[kMaxColumns];
-            for (std::size_t c = 0; c < n; ++c) {
-                xs[c] = x.data() + static_cast<std::size_t>(e.columns[c0 + c]) * kHidden;
+        alignas(32) float tile[kGateRowBlock][kTileColumns];
+        for (const std::size_t index : chunks_of[w]) {
+            const Chunk& chunk = chunks[index];
+            float* dst         = gate_up.data() + (base[w] + chunk.c0) * 2 * kIntermediate;
+            if (chunk.tile >= 0) {
+                tile_rows(m, row_begin, row_begin + kGateRowBlock,
+                          xt.data() + static_cast<std::size_t>(chunk.tile) * kHidden * kTileColumns, chunk.n, tile);
+                for (int c = 0; c < chunk.n; ++c) {
+                    for (int r = 0; r < kGateRowBlock; ++r) { dst[c * 2 * kIntermediate + row_begin + r] = tile[r][c]; }
+                }
+                continue;
             }
-            rows(m, block * kGateRowBlock, (block + 1) * kGateRowBlock, xs, static_cast<int>(n),
-                 gate_up.data() + (base[w] + c0) * 2 * kIntermediate, 2 * kIntermediate);
+            const float* xs[kTileColumns];
+            for (int c = 0; c < chunk.n; ++c) {
+                xs[c] = x.data() + static_cast<std::size_t>(e.columns[chunk.c0 + c]) * kHidden;
+            }
+            rows(m, row_begin, row_begin + kGateRowBlock, xs, chunk.n, dst, 2 * kIntermediate);
         }
     });
-    for (std::size_t i = 0; i < base.back(); ++i) {
-        const float* gu = gate_up.data() + i * 2 * kIntermediate;
-        float* a        = act.data() + i * kIntermediate;
-        for (int j = 0; j < kIntermediate; ++j) {
-            const float g = gu[j];
-            a[j]          = g / (1.0F + std::exp(-g)) * gu[kIntermediate + j];
+    pool.run(chunks.size(), [&](std::size_t index) {
+        const Chunk& chunk = chunks[index];
+        float* t = chunk.tile >= 0 ? act_t.data() + static_cast<std::size_t>(chunk.tile) * kIntermediate * kTileColumns
+                                   : nullptr;
+        for (int c = 0; c < kTileColumns; ++c) {
+            if (c >= chunk.n) {
+                if (t != nullptr) {
+                    for (int j = 0; j < kIntermediate; ++j) { t[j * kTileColumns + c] = 0.0F; }
+                }
+                continue;
+            }
+            const std::size_t i = base[chunk.w] + chunk.c0 + c;
+            const float* gu     = gate_up.data() + i * 2 * kIntermediate;
+            float* a            = act.data() + i * kIntermediate;
+            for (int j = 0; j < kIntermediate; ++j) {
+                const float g = gu[j];
+                a[j]          = g / (1.0F + std::exp(-g)) * gu[kIntermediate + j];
+                if (t != nullptr) { t[j * kTileColumns + c] = a[j]; }
+            }
         }
-    }
+    });
     constexpr int kDownBlocks = kHidden / kDownRowBlock;
     pool.run(kDownBlocks, [&](std::size_t block) {
         const int row_begin = static_cast<int>(block) * kDownRowBlock;
-        float partial[kMaxColumns * kDownRowBlock];
-        for (std::size_t w = 0; w < work.size(); ++w) {
-            const ColdExpertWork& e = work[w];
+        alignas(32) float tile[kDownRowBlock][kTileColumns];
+        float partial[kTileColumns * kDownRowBlock];
+        for (const Chunk& chunk : chunks) {
+            const ColdExpertWork& e = work[chunk.w];
             const Rows m{e.expert.down_codes, e.expert.down_high, e.expert.down_scales, kIntermediate,
                          bits_of(e.expert.down_qtype)};
-            for (std::size_t c0 = 0; c0 < e.columns.size(); c0 += kMaxColumns) {
-                const std::size_t n = std::min<std::size_t>(kMaxColumns, e.columns.size() - c0);
-                const float* as[kMaxColumns];
-                for (std::size_t c = 0; c < n; ++c) { as[c] = act.data() + (base[w] + c0 + c) * kIntermediate; }
-                rows(m, row_begin, row_begin + kDownRowBlock, as, static_cast<int>(n), partial, kDownRowBlock,
-                     row_begin);
-                for (std::size_t c = 0; c < n; ++c) {
-                    float* o = out + static_cast<std::size_t>(e.columns[c0 + c]) * kHidden + row_begin;
-                    for (int r = 0; r < kDownRowBlock; ++r) {
-                        o[r] += e.weights[c0 + c] * partial[c * kDownRowBlock + r];
-                    }
+            if (chunk.tile >= 0) {
+                tile_rows(m, row_begin, row_begin + kDownRowBlock,
+                          act_t.data() + static_cast<std::size_t>(chunk.tile) * kIntermediate * kTileColumns,
+                          chunk.n, tile);
+                for (int c = 0; c < chunk.n; ++c) {
+                    float* o           = out + static_cast<std::size_t>(e.columns[chunk.c0 + c]) * kHidden + row_begin;
+                    const float weight = e.weights[chunk.c0 + c];
+                    for (int r = 0; r < kDownRowBlock; ++r) { o[r] += weight * tile[r][c]; }
                 }
+                continue;
+            }
+            const float* as[kTileColumns];
+            for (int c = 0; c < chunk.n; ++c) { as[c] = act.data() + (base[chunk.w] + chunk.c0 + c) * kIntermediate; }
+            rows(m, row_begin, row_begin + kDownRowBlock, as, chunk.n, partial, kDownRowBlock, row_begin);
+            for (int c = 0; c < chunk.n; ++c) {
+                float* o = out + static_cast<std::size_t>(e.columns[chunk.c0 + c]) * kHidden + row_begin;
+                for (int r = 0; r < kDownRowBlock; ++r) { o[r] += e.weights[chunk.c0 + c] * partial[c * kDownRowBlock + r]; }
             }
         }
     });

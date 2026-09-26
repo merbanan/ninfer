@@ -112,6 +112,19 @@ void prefault(const std::vector<std::span<const std::byte>>& ranges, unsigned th
     for (auto& thread : pool) { thread.join(); }
 }
 
+// MemAvailable from /proc/meminfo, or 0 if unreadable.
+std::size_t available_host_bytes() {
+    std::FILE* file = std::fopen("/proc/meminfo", "r");
+    if (file == nullptr) { return 0; }
+    char line[256];
+    std::size_t kib = 0;
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        if (std::sscanf(line, "MemAvailable: %zu kB", &kib) == 1) { break; }
+    }
+    std::fclose(file);
+    return kib << 10;
+}
+
 double seconds_since(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
@@ -126,6 +139,16 @@ ExpertOffloadPolicy ExpertOffloadPolicy::from_environment() {
     if (out.host_threads == 0) { out.host_threads = std::max(1U, std::thread::hardware_concurrency() / 2); }
     out.admit_misses        = std::max(1U, env_u32("NINFER_OFFLOAD_ADMIT", out.admit_misses));
     out.prefetch_min_tokens = env_u32("NINFER_OFFLOAD_PREFETCH", out.prefetch_min_tokens);
+    out.hybrid_max_tokens   = env_u32("NINFER_OFFLOAD_HYBRID", out.hybrid_max_tokens);
+    out.pin_host_experts    = env_u32("NINFER_OFFLOAD_PIN", out.pin_host_experts ? 1 : 0) != 0;
+    if (const char* value = std::getenv("NINFER_OFFLOAD_UPLOAD_GBPS"); value != nullptr && value[0] != '\0') {
+        out.upload_gbps = std::max(0.1, std::strtod(value, nullptr));
+    }
+    if (const char* value = std::getenv("NINFER_OFFLOAD_HOST_US"); value != nullptr && value[0] != '\0') {
+        char* end              = nullptr;
+        out.host_us_per_expert = std::strtod(value, &end);
+        if (end != nullptr && *end == ',') { out.host_us_per_column = std::strtod(end + 1, nullptr); }
+    }
     return out;
 }
 
@@ -198,7 +221,7 @@ ExpertOffload::ExpertOffload(std::array<HostRoutedBanks, kOffloadTextLayers> ban
     CUDA_CHECK(cudaEventCreateWithFlags(&compute_mark_, cudaEventDisableTiming));
     cpu_pool_ = std::make_unique<ops::cpu::SpinPool>(policy_.host_threads);
     miss_counts_.assign(kOffloadTextLayers * kOffloadExperts, 0);
-    {
+    if (!(policy_.pin_host_experts && pin_banks())) {
         const auto started = std::chrono::steady_clock::now();
         std::vector<std::span<const std::byte>> ranges;
         for (const HostRoutedBanks& bank : banks_) {
@@ -213,6 +236,89 @@ ExpertOffload::ExpertOffload(std::array<HostRoutedBanks, kOffloadTextLayers> ban
         trace_ = std::fopen(path, "w");
     }
     prefetch_thread_ = std::thread([this] { prefetch_loop(); });
+}
+
+bool ExpertOffload::pin_banks() {
+    constexpr std::size_t kHeadroom = 8ULL << 30;
+    std::size_t total = 0;
+    for (const HostRoutedBanks& bank : banks_) { total += bank.gate_up.size() + bank.down.size(); }
+    const std::size_t available = available_host_bytes();
+    if (available < total + kHeadroom) {
+        std::fprintf(stderr,
+                     "[qwen3.6-35b-a3b expert offload] %.1f GiB available: routed experts stay in the file "
+                     "mapping (pinning them needs %.1f GiB)\n",
+                     static_cast<double>(available) / static_cast<double>(1ULL << 30),
+                     static_cast<double>(total + kHeadroom) / static_cast<double>(1ULL << 30));
+        return false;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    // Anonymous memory populated by the copy and registered afterwards: cudaMallocHost zeroes and
+    // pins page by page first, which measured 11.7 s for these 17.3 GiB against 1.8 s to register.
+    void* memory = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) {
+        std::fprintf(stderr, "[qwen3.6-35b-a3b expert offload] pinning routed experts failed: mmap\n");
+        return false;
+    }
+    (void)madvise(memory, total, MADV_HUGEPAGE);
+    auto* pinned = static_cast<std::byte*>(memory);
+    // Parallel copy in 64 MiB pieces; afterwards the mapping's pages are dropped (a private
+    // read-only file mapping refaults from the file if anything ever reads them again).
+    struct Piece {
+        std::byte* destination;
+        const std::byte* source;
+        std::size_t bytes;
+    };
+    constexpr std::size_t kPiece = 64ULL << 20;
+    std::vector<Piece> pieces;
+    std::array<std::byte*, kOffloadTextLayers> layer_base{};
+    std::byte* cursor = pinned;
+    for (std::size_t layer = 0; layer < kOffloadTextLayers; ++layer) {
+        layer_base[layer] = cursor;
+        cursor += banks_[layer].gate_up.size() + banks_[layer].down.size();
+        auto* destination = layer_base[layer];
+        for (const auto range : {banks_[layer].gate_up, banks_[layer].down}) {
+            for (std::size_t offset = 0; offset < range.size(); offset += kPiece) {
+                pieces.push_back({destination + offset, range.data() + offset, std::min(kPiece, range.size() - offset)});
+            }
+            destination += range.size();
+        }
+    }
+    std::atomic<std::size_t> next{0};
+    std::vector<std::thread> threads;
+    for (unsigned t = 0; t < 8; ++t) {
+        threads.emplace_back([&] {
+            for (std::size_t i = next++; i < pieces.size(); i = next++) {
+                std::memcpy(pieces[i].destination, pieces[i].source, pieces[i].bytes);
+            }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    const cudaError_t registered = cudaHostRegister(pinned, total, cudaHostRegisterPortable);
+    if (registered != cudaSuccess) {
+        (void)cudaGetLastError();
+        munmap(pinned, total);
+        std::fprintf(stderr, "[qwen3.6-35b-a3b expert offload] pinning routed experts failed: %s\n",
+                     cudaGetErrorString(registered));
+        return false;
+    }
+    const std::size_t page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    for (std::size_t layer = 0; layer < kOffloadTextLayers; ++layer) {
+        for (const auto range : {banks_[layer].gate_up, banks_[layer].down}) {
+            const auto begin = (reinterpret_cast<std::uintptr_t>(range.data()) + page - 1) / page * page;
+            const auto end   = reinterpret_cast<std::uintptr_t>(range.data() + range.size()) / page * page;
+            if (end > begin) { (void)madvise(reinterpret_cast<void*>(begin), end - begin, MADV_DONTNEED); }
+        }
+        const std::byte* base  = layer_base[layer];
+        const std::size_t gate = banks_[layer].gate_up.size();
+        banks_[layer].gate_up  = {base, gate};
+        banks_[layer].down     = {base + gate, banks_[layer].down.size()};
+    }
+    pinned_banks_ = pinned;
+    pinned_bytes_ = total;
+    pinned_       = true;
+    std::fprintf(stderr, "[qwen3.6-35b-a3b expert offload] pinned %.1f GiB of routed experts in %.1f s\n",
+                 static_cast<double>(total) / static_cast<double>(1ULL << 30), seconds_since(started));
+    return true;
 }
 
 ExpertOffload::~ExpertOffload() {
@@ -238,6 +344,10 @@ ExpertOffload::~ExpertOffload() {
     if (compute_mark_ != nullptr) { (void)cudaEventDestroy(compute_mark_); }
     if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
     if (trace_ != nullptr) { std::fclose(trace_); }
+    if (pinned_banks_ != nullptr) {
+        (void)cudaHostUnregister(pinned_banks_);
+        munmap(pinned_banks_, pinned_bytes_);
+    }
     if (stats_.calls != 0) {
         const auto pct = [&](std::uint64_t part) {
             return stats_.lookups == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(stats_.lookups);
@@ -245,14 +355,17 @@ ExpertOffload::~ExpertOffload() {
         std::fprintf(stderr,
                      "[qwen3.6-35b-a3b expert offload] %llu MoE calls, %llu expert lookups, %.1f%% cache hits, "
                      "%.1f%% host-computed, %.1f%% uploaded before use, %llu background promotions, %llu of %llu "
-                     "prefetched claimed in flight, %.2f GiB copied, %.2f s staging, %.2f s host experts\n",
+                     "prefetched claimed in flight, %.2f GiB copied, %.2f s staging, %.2f s host experts (%llu columns), "
+                     "%llu hybrid prefill calls (%.2f s waiting for their uploads)\n",
                      static_cast<unsigned long long>(stats_.calls), static_cast<unsigned long long>(stats_.lookups),
                      pct(stats_.hits), pct(stats_.cold), pct(stats_.uploads),
                      static_cast<unsigned long long>(stats_.promotions),
                      static_cast<unsigned long long>(stats_.prefetch_used),
                      static_cast<unsigned long long>(stats_.prefetched),
                      static_cast<double>(stats_.bytes_copied) / static_cast<double>(1ULL << 30),
-                     stats_.upload_seconds, stats_.host_compute_seconds);
+                     stats_.upload_seconds, stats_.host_compute_seconds,
+                     static_cast<unsigned long long>(stats_.cold_columns),
+                     static_cast<unsigned long long>(stats_.hybrid_calls), stats_.upload_wait_seconds);
         if (stats_.prefill_moe_seconds > 0) {
             std::fprintf(stderr, "[qwen3.6-35b-a3b expert offload] prefill MoE wall time %.2f s\n",
                          stats_.prefill_moe_seconds);
@@ -392,6 +505,24 @@ void ExpertOffload::upload(const Pool& pool, std::uint32_t slot, const std::byte
     }
 }
 
+void ExpertOffload::upload_pinned(const Pool& pool, std::size_t layer, std::int32_t expert, std::uint32_t slot,
+                                  cudaStream_t stream) const {
+    const PlaneLayout& p                 = pool.planes;
+    const ops::cpu::HostExpertView view = host_view(layer, expert);
+    const std::size_t s                  = slot;
+    for (auto [plane, source, rows, row_bytes] :
+         {std::tuple{&pool.gate_codes, view.gate_codes, kGateRows, p.gate_code_row},
+          std::tuple{&pool.gate_scales, view.gate_scales, kGateRows, p.gate_scale_row},
+          std::tuple{&pool.down_codes, view.down_codes, kDownRows, p.down_code_row},
+          std::tuple{&pool.down_high, view.down_high, kDownRows, p.down_high_row},
+          std::tuple{&pool.down_scales, view.down_scales, kDownRows, p.down_scale_row}}) {
+        const std::size_t bytes = static_cast<std::size_t>(rows) * row_bytes;
+        if (bytes == 0) { continue; }
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(plane->p) + s * bytes, source, bytes,
+                                   cudaMemcpyHostToDevice, stream));
+    }
+}
+
 void ExpertOffload::retire_promotions() {
     for (std::size_t i = 0; i < promotions_.size();) {
         const Promotion& promotion = promotions_[i];
@@ -421,14 +552,18 @@ void ExpertOffload::prefetch_loop() {
             job = prefetch_queue_.front();
             prefetch_queue_.pop_front();
         }
-        const std::size_t b = turn++ % prefetch_buffers_.size();
-        CUDA_CHECK(cudaEventSynchronize(prefetch_buffer_free_[b]));
-        auto* staging    = static_cast<std::byte*>(prefetch_buffers_[b]->data());
         const Pool& pool = pools_[job->pool];
-        stage(pool, job->layer, job->expert, staging);
-        upload(pool, job->slot, staging, copy_stream_);
+        if (pinned_) {
+            upload_pinned(pool, job->layer, job->expert, job->slot, copy_stream_);
+        } else {
+            const std::size_t b = turn++ % prefetch_buffers_.size();
+            CUDA_CHECK(cudaEventSynchronize(prefetch_buffer_free_[b]));
+            auto* staging = static_cast<std::byte*>(prefetch_buffers_[b]->data());
+            stage(pool, job->layer, job->expert, staging);
+            upload(pool, job->slot, staging, copy_stream_);
+            CUDA_CHECK(cudaEventRecord(prefetch_buffer_free_[b], copy_stream_));
+        }
         CUDA_CHECK(cudaEventRecord(job->done, copy_stream_));
-        CUDA_CHECK(cudaEventRecord(prefetch_buffer_free_[b], copy_stream_));
         {
             std::lock_guard<std::mutex> lock(prefetch_mutex_);
             job->issued = true;
@@ -473,18 +608,7 @@ void ExpertOffload::plan_prefetch(std::size_t layer, std::size_t pool_index) {
         target.pending   = true;
         target.last_used = clock_;
         keep[static_cast<std::size_t>(best)] = 1;
-        auto job    = std::make_unique<PrefetchJob>();
-        job->pool   = next_pool;
-        job->slot   = static_cast<std::uint32_t>(best);
-        job->layer  = next;
-        job->expert = expert;
-        if (free_events_.empty()) {
-            cudaEvent_t event = nullptr;
-            CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-            free_events_.push_back(event);
-        }
-        job->done = free_events_.back();
-        free_events_.pop_back();
+        auto job = make_job(next_pool, static_cast<std::uint32_t>(best), next, expert);
         planned.push_back(job.get());
         prefetches_[key] = std::move(job);
         ++stats_.prefetched;
@@ -496,6 +620,23 @@ void ExpertOffload::plan_prefetch(std::size_t layer, std::size_t pool_index) {
         for (PrefetchJob* job : planned) { prefetch_queue_.push_back(job); }
     }
     prefetch_wake_.notify_one();
+}
+
+std::unique_ptr<ExpertOffload::PrefetchJob> ExpertOffload::make_job(std::size_t pool_index, std::uint32_t slot,
+                                                                    std::size_t layer, std::int32_t expert) {
+    auto job    = std::make_unique<PrefetchJob>();
+    job->pool   = pool_index;
+    job->slot   = slot;
+    job->layer  = layer;
+    job->expert = expert;
+    if (free_events_.empty()) {
+        cudaEvent_t event = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        free_events_.push_back(event);
+    }
+    job->done = free_events_.back();
+    free_events_.pop_back();
+    return job;
 }
 
 void ExpertOffload::claim_prefetch(std::int64_t key, cudaStream_t stream) {
@@ -544,8 +685,95 @@ std::int64_t ExpertOffload::victim(Pool& pool) const {
     return best;
 }
 
+void ExpertOffload::acquire_hybrid(std::size_t layer, std::size_t pool_index, std::span<const std::int32_t> selected,
+                                   std::int32_t* bank_of_expert, std::uint64_t tick, cudaStream_t stream) {
+    Pool& pool = pools_[pool_index];
+    std::array<std::int32_t, kOffloadExperts> columns{};
+    for (const std::int32_t expert : selected) { ++columns[static_cast<std::size_t>(expert)]; }
+    std::sort(missing_.begin(), missing_.end(), [&](std::int32_t a, std::int32_t b) {
+        return columns[static_cast<std::size_t>(a)] < columns[static_cast<std::size_t>(b)];
+    });
+    // The host takes the cheapest prefix (fewest columns) that minimizes the slower of the two.
+    const double upload_us =
+        static_cast<double>(pool.planes.expert_bytes()) / (policy_.upload_gbps * 1e3);
+    const std::size_t missing = missing_.size();
+    std::size_t host_count    = 0;
+    double best               = static_cast<double>(missing) * upload_us;
+    double host_us            = 0.0;
+    for (std::size_t k = 1; k <= missing; ++k) {
+        host_us += policy_.host_us_per_expert +
+                   policy_.host_us_per_column * columns[static_cast<std::size_t>(missing_[k - 1])];
+        const double cost = std::max(host_us, static_cast<double>(missing - k) * upload_us);
+        if (cost < best) {
+            best       = cost;
+            host_count = k;
+        }
+    }
+    ++stats_.hybrid_calls;
+
+    // Uploads go to the background thread, most-selected first, ahead of any queued prefetch.
+    std::vector<std::pair<std::int64_t, PrefetchJob*>> uploads;
+    for (std::size_t m = missing; m-- > host_count;) {
+        const std::int32_t expert = missing_[m];
+        const std::int64_t slot   = victim(pool);
+        if (slot < 0) { throw std::logic_error("35B expert offload: request exceeds the evictable slots"); }
+        Slot& target = pool.slots[static_cast<std::size_t>(slot)];
+        if (target.key >= 0) {
+            resident_.erase(target.key);
+        } else {
+            --empty_slots_[pool_index];
+        }
+        const std::int64_t key = static_cast<std::int64_t>(layer) * kOffloadExperts + expert;
+        target.key       = key;
+        target.last_used = tick;
+        target.pending   = true;
+        needed_[static_cast<std::size_t>(slot)] = 1;
+        bank_of_expert[expert] = static_cast<std::int32_t>(slot);
+        auto job = make_job(pool_index, static_cast<std::uint32_t>(slot), layer, expert);
+        uploads.emplace_back(key, job.get());
+        prefetches_[key] = std::move(job);
+        ++stats_.uploads;
+        stats_.bytes_copied += pool.planes.expert_bytes();
+    }
+    if (!uploads.empty()) {
+        // Every earlier device read of the victim slots is on `stream` before this point.
+        CUDA_CHECK(cudaEventRecord(compute_mark_, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, compute_mark_, 0));
+        {
+            std::lock_guard<std::mutex> lock(prefetch_mutex_);
+            for (auto it = uploads.rbegin(); it != uploads.rend(); ++it) { prefetch_queue_.push_front(it->second); }
+        }
+        prefetch_wake_.notify_one();
+    }
+    // The host computes the rest while those upload.
+    for (std::size_t m = 0; m < host_count; ++m) {
+        bank_of_expert[missing_[m]] = -1;
+        ++stats_.cold;
+    }
+    if (host_count != 0) {
+        const auto host_started = std::chrono::steady_clock::now();
+        cold_compute(layer, selected, static_cast<const float*>(host_alpha_.data()),
+                     static_cast<const std::uint16_t*>(host_x_.data()),
+                     static_cast<std::int32_t>(selected.size() / kTopK), bank_of_expert,
+                     static_cast<float*>(host_cold_sum_.data()));
+        static const bool trace_hybrid = std::getenv("NINFER_OFFLOAD_HYBRID_TRACE") != nullptr;
+        if (trace_hybrid) {
+            std::size_t host_columns = 0;
+            for (std::size_t m = 0; m < host_count; ++m) { host_columns += columns[static_cast<std::size_t>(missing_[m])]; }
+            std::fprintf(stderr, "[hybrid] layer %zu tokens %zu missing %zu host %zu (%zu columns, max %d) %.2f ms\n",
+                         layer, selected.size() / kTopK, missing, host_count, host_columns,
+                         columns[static_cast<std::size_t>(missing_[host_count - 1])],
+                         seconds_since(host_started) * 1e3);
+        }
+    }
+    const auto waited = std::chrono::steady_clock::now();
+    for (const auto& [key, job] : uploads) { claim_prefetch(key, stream); }
+    stats_.upload_wait_seconds += seconds_since(waited);
+}
+
 void ExpertOffload::acquire(std::size_t layer, std::span<const std::int32_t> selected, std::int32_t* bank_of_expert,
-                            bool cold_allowed, cudaStream_t stream) {
+                            ops::SparseMoeColdMode cold_mode, cudaStream_t stream) {
+    const bool cold_allowed = cold_mode == ops::SparseMoeColdMode::Decode;
     retire_promotions();
     retire_prefetches();
     const std::size_t pool_index = static_cast<std::size_t>(pool_of_layer_[layer]);
@@ -585,7 +813,7 @@ void ExpertOffload::acquire(std::size_t layer, std::span<const std::int32_t> sel
         }
     }
     const std::size_t tokens  = selected.size() / kTopK;
-    const bool prefetch_next = !cold_allowed && policy_.prefetch_min_tokens != 0 &&
+    const bool prefetch_next = cold_mode == ops::SparseMoeColdMode::None && policy_.prefetch_min_tokens != 0 &&
                                tokens >= policy_.prefetch_min_tokens;
     if (missing_.empty()) {
         if (prefetch_next) { plan_prefetch(layer, pool_index); }
@@ -593,6 +821,10 @@ void ExpertOffload::acquire(std::size_t layer, std::span<const std::int32_t> sel
     }
 
     const auto started = std::chrono::steady_clock::now();
+    if (cold_mode == ops::SparseMoeColdMode::Prefill) {
+        acquire_hybrid(layer, pool_index, selected, bank_of_expert, tick, stream);
+        return;
+    }
     if (cold_allowed && policy_.host_cold_experts) {
         // The host computes every missing expert for this call; a few are uploaded in the
         // background so the device cache follows the routing.
@@ -638,9 +870,13 @@ void ExpertOffload::acquire(std::size_t layer, std::span<const std::int32_t> sel
             target.key       = key;
             target.last_used = tick;
             target.pending   = true;
-            stage(pool, layer, expert, static_cast<std::byte*>(promotion_buffers_[b]->data()));
-            upload(pool, static_cast<std::uint32_t>(slot), static_cast<const std::byte*>(promotion_buffers_[b]->data()),
-                   copy_stream_);
+            if (pinned_) {
+                upload_pinned(pool, layer, expert, static_cast<std::uint32_t>(slot), copy_stream_);
+            } else {
+                stage(pool, layer, expert, static_cast<std::byte*>(promotion_buffers_[b]->data()));
+                upload(pool, static_cast<std::uint32_t>(slot),
+                       static_cast<const std::byte*>(promotion_buffers_[b]->data()), copy_stream_);
+            }
             CUDA_CHECK(cudaEventRecord(promotion_done_[b], copy_stream_));
             promotion_busy_[b] = true;
             promotions_.push_back(Promotion{pool_index, static_cast<std::uint32_t>(slot), b});
@@ -664,13 +900,17 @@ void ExpertOffload::acquire(std::size_t layer, std::span<const std::int32_t> sel
             --empty_slots_[pool_index];
         }
 
-        const std::size_t buffer = m % staging_.size();
-        if (staging_pending_[buffer]) { CUDA_CHECK(cudaEventSynchronize(staging_free_[buffer])); }
-        auto* staging = static_cast<std::byte*>(staging_[buffer]->data());
-        stage(pool, layer, expert, staging);
-        upload(pool, static_cast<std::uint32_t>(slot), staging, stream);
-        CUDA_CHECK(cudaEventRecord(staging_free_[buffer], stream));
-        staging_pending_[buffer] = true;
+        if (pinned_) {
+            upload_pinned(pool, layer, expert, static_cast<std::uint32_t>(slot), stream);
+        } else {
+            const std::size_t buffer = m % staging_.size();
+            if (staging_pending_[buffer]) { CUDA_CHECK(cudaEventSynchronize(staging_free_[buffer])); }
+            auto* staging = static_cast<std::byte*>(staging_[buffer]->data());
+            stage(pool, layer, expert, staging);
+            upload(pool, static_cast<std::uint32_t>(slot), staging, stream);
+            CUDA_CHECK(cudaEventRecord(staging_free_[buffer], stream));
+            staging_pending_[buffer] = true;
+        }
 
         target.key       = static_cast<std::int64_t>(layer) * kOffloadExperts + expert;
         target.last_used = tick;
@@ -701,6 +941,7 @@ void ExpertOffload::cold_compute(std::size_t layer, std::span<const std::int32_t
         auto& item = work[static_cast<std::size_t>(work_of_expert[expert])];
         item.columns.push_back(static_cast<std::int32_t>(i / kTopK));
         item.weights.push_back(alpha[i]);
+        ++stats_.cold_columns;
     }
     ops::cpu::cold_experts(work, x_bf16, tokens, cold_sum, *cpu_pool_);
     stats_.host_compute_seconds += seconds_since(started);
@@ -722,8 +963,8 @@ void ExpertOffload::sparse_moe(std::size_t layer, const Tensor& x, const ops::Sp
         .host_bank_of_expert = static_cast<std::int32_t*>(host_bank_of_expert_.data()),
         .banks               = static_cast<std::int32_t>(pool.slots.size()) + 1,
         .acquire             = [this, layer](std::span<const std::int32_t> selected, std::int32_t* bank_of_expert,
-                                 bool cold_allowed, cudaStream_t s) {
-            acquire(layer, selected, bank_of_expert, cold_allowed, s);
+                                 ops::SparseMoeColdMode cold_mode, cudaStream_t s) {
+            acquire(layer, selected, bank_of_expert, cold_mode, s);
         },
     };
     if (policy_.host_cold_experts) {
@@ -731,6 +972,7 @@ void ExpertOffload::sparse_moe(std::size_t layer, const Tensor& x, const ops::Sp
         residency.host_alpha    = static_cast<float*>(host_alpha_.data());
         residency.host_x        = static_cast<std::uint16_t*>(host_x_.data());
         residency.host_cold_sum = static_cast<float*>(host_cold_sum_.data());
+        residency.prefill_cold_max_tokens = static_cast<std::int32_t>(policy_.hybrid_max_tokens);
         residency.cold_compute  = [this, layer](std::span<const std::int32_t> selected, const float* alpha,
                                                const std::uint16_t* x_bf16, std::int32_t tokens,
                                                const std::int32_t* bank_of_expert, float* cold_sum) {

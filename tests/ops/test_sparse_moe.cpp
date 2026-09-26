@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -603,14 +604,17 @@ public:
             cuda_check(cudaMallocHost(&host_cold, sizeof(float) * kHidden * tokens), "pin cold");
             std::vector<bool> staged(kExperts, false);
             ops::cpu::SpinPool pool(4);
-            int cold_experts_seen = 0;
+            int cold_experts_seen  = 0;
+            int prefill_cold_calls = 0;
+            std::function<void(std::span<const std::int32_t>, const std::int32_t*)> cold_sum_into_host;
             ops::SparseMoeExpertResidency residency{
                 .host_ids            = host_ids,
                 .host_bank_of_expert = host_banks,
                 .banks               = kOffloadBanks,
                 .acquire =
                     [&](std::span<const std::int32_t> selected, std::int32_t* bank_of_expert,
-                        bool cold_allowed, cudaStream_t) {
+                        ops::SparseMoeColdMode cold_mode, cudaStream_t) {
+                        const bool cold_allowed = cold_mode != ops::SparseMoeColdMode::None;
                         for (const std::int32_t expert : selected) {
                             requested_experts.insert(expert);
                             const int slot = offload_slot(expert);
@@ -630,10 +634,17 @@ public:
                             }
                             bank_of_expert[expert] = slot;
                         }
+                        // Prefill mode: acquire itself leaves the cold sum in host_cold_sum.
+                        if (cold_mode == ops::SparseMoeColdMode::Prefill) {
+                            prefill_cold_calls += 1;
+                            cold_sum_into_host(selected, bank_of_expert);
+                        }
                     },
             };
             if (with_cold) {
                 residency.zero_bank   = kZeroBank;
+                // Every prefill-size call of this test takes the Prefill cold mode.
+                residency.prefill_cold_max_tokens = tokens;
                 residency.host_alpha  = host_alpha;
                 residency.host_x      = host_x;
                 residency.host_cold_sum = host_cold;
@@ -658,11 +669,21 @@ public:
                     ops::cpu::cold_experts(work, x_bf16, columns, cold_sum, pool);
                 };
             }
+            cold_sum_into_host = [&](std::span<const std::int32_t> selected,
+                                     const std::int32_t* bank_of_expert) {
+                residency.cold_compute(selected, host_alpha, host_x,
+                                       static_cast<std::int32_t>(selected.size() / kTopK),
+                                       bank_of_expert, host_cold);
+            };
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, residency,
                             workspace, nullptr);
             cuda_synchronize();
-            if (with_cold && tokens <= 46 && cold_experts_seen == 0) {
+            if (with_cold && cold_experts_seen == 0) {
                 std::cerr << label << ": no expert was computed on the host\n";
+                ++residency_failures;
+            }
+            if (with_cold && tokens > 46 && prefill_cold_calls == 0) {
+                std::cerr << label << ": the prefill call did not take the Prefill cold mode\n";
                 ++residency_failures;
             }
             for (void* pinned : {static_cast<void*>(host_ids), static_cast<void*>(host_banks),

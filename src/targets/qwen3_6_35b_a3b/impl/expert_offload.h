@@ -54,9 +54,23 @@ struct ExpertOffloadPolicy {
     // bulk queue delays the experts the next layer actually selects (measured: a 91-token prompt
     // prefilled at 23 instead of 31 tok/s with a 64-token threshold).
     std::uint32_t prefetch_min_tokens = 256;
+    // Prefill calls of at most this many tokens split their missing experts between uploads and
+    // the host by estimated cost (0 disables): an upload costs expert bytes / upload_gbps
+    // whatever its token count, the host host_us_per_expert + host_us_per_column per routed
+    // column, so the host takes the experts few tokens selected. Larger calls upload everything
+    // and prefetch the next layer instead.
+    std::uint32_t hybrid_max_tokens = 2048;
+    // Copy the routed experts into pinned host memory at load when MemAvailable leaves at least
+    // 8 GiB beside them. Uploads are then direct DMA from that copy instead of a CPU copy into a
+    // staging buffer first, which halved host expert throughput while uploads ran beside it.
+    bool pin_host_experts = true;
+    double upload_gbps              = 6.5;
+    double host_us_per_expert       = 60.0;
+    double host_us_per_column       = 12.0;
 
     // Defaults, overridden by NINFER_OFFLOAD_COLD, NINFER_OFFLOAD_PROMOTE, NINFER_OFFLOAD_CPU_THREADS,
-    // NINFER_OFFLOAD_ADMIT, NINFER_OFFLOAD_PREFETCH.
+    // NINFER_OFFLOAD_ADMIT, NINFER_OFFLOAD_PREFETCH, NINFER_OFFLOAD_HYBRID, NINFER_OFFLOAD_UPLOAD_GBPS,
+    // NINFER_OFFLOAD_HOST_US ("<per expert>,<per column>"), NINFER_OFFLOAD_PIN.
     [[nodiscard]] static ExpertOffloadPolicy from_environment();
 };
 
@@ -65,13 +79,16 @@ struct ExpertOffloadStats {
     std::uint64_t lookups       = 0; // distinct (call, expert) pairs
     std::uint64_t hits          = 0; // resident on the device
     std::uint64_t cold          = 0; // computed on the host
+    std::uint64_t cold_columns  = 0; // routed columns of the host-computed experts
     std::uint64_t uploads       = 0; // uploaded before use (prefill-size calls)
     std::uint64_t promotions    = 0; // uploaded in the background
     std::uint64_t prefetched    = 0; // uploaded ahead of their layer during prefill
     std::uint64_t prefetch_used = 0; // prefetched experts the next layer selected
+    std::uint64_t hybrid_calls  = 0; // prefill calls that split missing experts with the host
     std::uint64_t bytes_copied  = 0;
     double upload_seconds       = 0.0; // host time staging uploads on the critical path
     double host_compute_seconds = 0.0;
+    double upload_wait_seconds  = 0.0; // hybrid calls: host time waiting for their uploads to issue
     double prefill_moe_seconds  = 0.0; // NINFER_OFFLOAD_TIMING only
 };
 
@@ -151,7 +168,13 @@ private:
     };
 
     void acquire(std::size_t layer, std::span<const std::int32_t> selected, std::int32_t* bank_of_expert,
-                 bool cold_allowed, cudaStream_t stream);
+                 ops::SparseMoeColdMode cold_mode, cudaStream_t stream);
+    // Prefill-mode split of missing_ between background uploads and the host (see the policy).
+    void acquire_hybrid(std::size_t layer, std::size_t pool_index, std::span<const std::int32_t> selected,
+                        std::int32_t* bank_of_expert, std::uint64_t tick, cudaStream_t stream);
+    // A background upload job of `expert` of `layer` into `slot`, which the caller has claimed.
+    std::unique_ptr<PrefetchJob> make_job(std::size_t pool_index, std::uint32_t slot, std::size_t layer,
+                                          std::int32_t expert);
     void cold_compute(std::size_t layer, std::span<const std::int32_t> selected, const float* alpha,
                       const std::uint16_t* x_bf16, std::int32_t tokens, const std::int32_t* bank_of_expert,
                       float* cold_sum);
@@ -164,12 +187,22 @@ private:
     // Least recently used slot outside `needed_` that has no upload in flight, or -1.
     [[nodiscard]] std::int64_t victim(Pool& pool) const;
     void upload(const Pool& pool, std::uint32_t slot, const std::byte* staging, cudaStream_t stream) const;
+    // Uploads `expert` of `layer` into `slot` straight from the pinned host copy.
+    void upload_pinned(const Pool& pool, std::size_t layer, std::int32_t expert, std::uint32_t slot,
+                       cudaStream_t stream) const;
+    // Moves the routed banks into pinned host memory; false (and nothing changed) if it cannot.
+    bool pin_banks();
     void stage(const Pool& pool, std::size_t layer, std::int32_t expert, std::byte* staging) const;
     [[nodiscard]] ops::cpu::HostExpertView host_view(std::size_t layer, std::int32_t expert) const;
     [[nodiscard]] static PlaneLayout plane_layout(artifact::NumericFormat down_format);
 
     std::array<HostRoutedBanks, kOffloadTextLayers> banks_;
     std::array<HostPlanes, kOffloadTextLayers> host_planes_{};
+    // Pinned copy of every layer's routed banks (gate/up then down, layer after layer): anonymous
+    // memory the copy itself populates, registered with CUDA afterwards.
+    std::byte* pinned_banks_   = nullptr;
+    std::size_t pinned_bytes_  = 0;
+    bool pinned_               = false;
     ExpertOffloadPolicy policy_;
     std::size_t requested_bytes_ = 0;
     std::int32_t max_tokens_     = 1;

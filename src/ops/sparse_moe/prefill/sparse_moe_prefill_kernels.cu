@@ -1797,6 +1797,12 @@ __global__ void sparse_moe_prefill_shared_combine_kernel(const __nv_bfloat16* __
                                          shared_scale[col] * __bfloat162float(shared[i]));
 }
 
+__global__ void sparse_moe_prefill_add_kernel(const float* __restrict__ addend, float* __restrict__ sum,
+                                              std::int64_t count) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) { sum[i] += addend[i]; }
+}
+
 bool prefill_mma_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_MOE_PREFILL_MMA");
@@ -1938,8 +1944,15 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             scores, ids, alpha, shared_scale, local_rank, tile_counts, tokens);
         CUDA_CHECK(cudaGetLastError());
         stage_timer.mark(2);
+        bool cold = false;
         if (residency != nullptr) {
-            resolve_sparse_moe_residency(*residency, ids, assignments, false, bank_of_expert, stream);
+            if (residency->cold_compute && tokens <= residency->prefill_cold_max_tokens) {
+                cold = resolve_sparse_moe_residency_prefill(*residency, ids, alpha, input, tokens,
+                                                            bank_of_expert, stream);
+            } else {
+                resolve_sparse_moe_residency(*residency, ids, assignments, false, bank_of_expert,
+                                             stream);
+            }
         }
 
 #ifdef NINFER_VOLTA_BUILD
@@ -2208,6 +2221,18 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                 grouped_io, packed_index, alpha, routed_sum, nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
+#ifdef NINFER_VOLTA_BUILD
+        if (cold) {
+            // The host-computed experts' sum, staged through the routed gate/up scratch (free
+            // until the shared down projection below reuses it).
+            auto* cold_sum = static_cast<float*>(workspace.routed_gate_up.data);
+            upload_sparse_moe_cold_sum(*residency, tokens, cold_sum, stream);
+            const std::int64_t elements = static_cast<std::int64_t>(tokens) * kHidden;
+            sparse_moe_prefill_add_kernel<<<static_cast<unsigned>((elements + 255) / 256), 256, 0,
+                                            stream>>>(cold_sum, routed_sum, elements);
+            CUDA_CHECK(cudaGetLastError());
+        }
+#endif
         stage_timer.mark(8);
 
         const dim3 shared_down_grid(kHidden / kExpertBM, (tokens + kExpertBN - 1) / kExpertBN);
