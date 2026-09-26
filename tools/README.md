@@ -39,6 +39,11 @@ python3 -m tools.convert.qwen3_6_35b_a3b.convert \
   --model /path/to/Qwen3.6-35B-A3B-base \
   --dflash-model /path/to/Qwen3.6-35B-A3B-DFlash \
   --out out/qwen3_6_35b_a3b.ninfer
+
+# Or re-frame the published container-v3 artifact for this runtime (no re-quantization):
+python3 -m tools.convert.qwen3_6_35b_a3b.from_published_v3 \
+  --published /path/to/qwen3_6_35b_a3b.ninfer \
+  --out out/qwen3_6_35b_a3b.ninfer
 ```
 
 Inspect either result:

@@ -6,6 +6,7 @@
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 
+#include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -272,8 +273,25 @@ struct SmallTWorkspace {
 };
 
 #ifdef NINFER_VOLTA_BUILD
+// The vendored llama.cpp Volta MMA flash kernel is qualified on sm_70 only; the sm_70 image run on
+// Turing (7.5, 64 KiB shared memory per block) faults inside it, so Turing keeps the generic
+// causal route for every width.
+bool current_device_is_volta() {
+    static const bool volta = [] {
+        int device = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+            return true;
+        }
+        return major == 7 && minor == 0;
+    }();
+    return volta;
+}
+
 bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
                                 std::int32_t batch_size, KvCacheStorage cache_storage) {
+    if (!current_device_is_volta()) { return false; }
     const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
                                     q_heads == CausalD256H16Kv2::QHeads;
     return supported_geometry && batch_size == 1 &&

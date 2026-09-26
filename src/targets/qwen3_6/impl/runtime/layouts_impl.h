@@ -723,8 +723,10 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value) {
         throw std::invalid_argument("NVFP4 KV-cache storage is unavailable on Volta");
     }
-    if (device.compute_capability() != 70) {
-        throw std::invalid_argument("Qwen3.6 family Volta runtime requires compute capability 7.0");
+    // The sm_70 image also runs on Turing (7.5): its cubins are binary-compatible within major 7.
+    if (device.compute_capability() != 70 && device.compute_capability() != 75) {
+        throw std::invalid_argument(
+            "Qwen3.6 family Volta runtime requires compute capability 7.0 or 7.5");
     }
 #else
     if (device.compute_capability() != 120) {

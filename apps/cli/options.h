@@ -28,6 +28,8 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    bool offload_experts = false;
+    std::size_t expert_cache_bytes = 0;
 
     bool raw_output      = false;
     bool print_token_ids = false;

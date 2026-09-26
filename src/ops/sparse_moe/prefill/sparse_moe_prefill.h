@@ -53,6 +53,8 @@ struct SparseMoePrefillWorkspace {
     // A negative count selects the token-oriented adaptive route; its magnitude is the unused
     // grouped-route job count. Nonnegative values select the normal grouped route.
     Tensor route_job_count;
+    // Offloaded experts only: expert id -> bank holding its rows.
+    Tensor bank_of_expert;
 
     // The three large allocations are lifetime unions:
     //   router scores FP32 <-> shared SwiGLU BF16
@@ -93,6 +95,7 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     out.route_job_experts             = arena.alloc(DType::I32, {max_route_jobs}, 256);
     out.route_job_columns             = arena.alloc(DType::I32, {max_route_jobs}, 256);
     out.route_job_count               = arena.alloc(DType::I32, {1}, 256);
+    out.bank_of_expert                = arena.alloc(DType::I32, {256}, 256);
 
     out.score_storage = arena.alloc(DType::FP32, {kSparseMoeRouterScoreRows, capacity_tokens}, 256);
     out.shared_activation = Tensor(out.score_storage.data, DType::BF16, {512, capacity_tokens});
@@ -110,8 +113,11 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
 [[nodiscard]] SparseMoePrefillPlan
 resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down);
 
+// A non-null residency (sm_70 only) synchronizes once per slice after routing; the grouped
+// expert kernels then read each expert's rows from the bank the residency assigned.
 void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
-                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream);
+                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
+                               const SparseMoeExpertResidency* residency = nullptr);
 
 } // namespace ninfer::ops::detail

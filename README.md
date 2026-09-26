@@ -97,6 +97,20 @@ QPN prepacking work was inspired by
 The 35B-A3B production DFlash round at a 2,048-token context uses K=3: **125.9 tok/s** and 3.8
 mean output tokens per round over ten measured rounds after two warmups.
 
+## Qwen3.6-35B-A3B on an 8 GB GPU (expert offload)
+
+With the sm_70 build, `--offload-experts` keeps the 35B-A3B routed experts in host RAM and streams
+them through a device expert cache, so the model runs on 8 GB Volta/Turing cards (tested on an
+RTX 2060 SUPER: ~28 tok/s decode, ~130 tok/s prefill). Convert the published artifact once, then:
+
+```bash
+python3 -m tools.convert.qwen3_6_35b_a3b.from_published_v3 \
+  --published qwen3_6_35b_a3b.ninfer --out qwen3_6_35b_a3b.v2.ninfer
+ninfer qwen3_6_35b_a3b.v2.ninfer --offload-experts --max-context 8192 --prompt "Hello"
+```
+
+Details and measurements: [V100 port](docs/v100.md#qwen36-35b-a3b-with-experts-in-host-memory).
+
 ## Quick start
 
 NInfer requires 64-bit Linux, a Tesla V100 with CUDA Toolkit 12.8, CMake 3.28 or newer, a C++20

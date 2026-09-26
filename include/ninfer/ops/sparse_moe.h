@@ -7,6 +7,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -34,6 +36,26 @@ enum class SparseMoeEpilogue : std::uint8_t {
 struct SparseMoeHints {
     const void* next_weight_prefetch       = nullptr;
     std::size_t next_weight_prefetch_bytes = 0;
+};
+
+/**
+ * Routed experts that live outside device memory (expert offload, sm_70 build only).
+ *
+ * The routed-bank views in SparseMoeWeights then hold `banks` experts in the registered row
+ * geometry ([banks*1024,2048] gate/up, [banks*2048,512] down) instead of all 256. After routing,
+ * the Op copies the selected expert ids to `host_ids` and synchronizes `stream` once; `acquire`
+ * must make every selected expert resident in some bank, write each selected expert's bank index
+ * to `bank_of_expert[expert]` (entries of unselected experts are ignored), and order any copies
+ * it needs on `stream`. Routing, tie-breaking, token grouping, and the result are exactly those
+ * of the resident Op; only the bank each expert's rows are read from changes.
+ */
+struct SparseMoeExpertResidency {
+    std::int32_t* host_ids            = nullptr; // pinned host storage, >= 8 * T entries
+    std::int32_t* host_bank_of_expert = nullptr; // pinned host storage, 256 entries
+    std::int32_t banks                = 0;
+    std::function<void(std::span<const std::int32_t> selected_ids, std::int32_t* bank_of_expert,
+                       cudaStream_t stream)>
+        acquire;
 };
 
 /**
@@ -75,6 +97,14 @@ struct SparseMoeHints {
  */
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * The same Op over offloaded routed experts (see SparseMoeExpertResidency). The Q4+Q5 and Q4+Q6
+ * routed profiles are admitted; the workspace requirement is the resident Op's.
+ */
+void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                Tensor& destination, const SparseMoeExpertResidency& residency,
+                WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
  * The same Op with caller-supplied execution hints. Semantics, workspace requirement and output

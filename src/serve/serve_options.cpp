@@ -80,7 +80,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--no-cuda-graph] [--offload-experts] [--expert-cache-gib N] "
+           "[--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -282,6 +283,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--offload-experts") {
+            options.offload_experts = true;
+        } else if (arg == "--expert-cache-gib") {
+            options.offload_experts    = true;
+            options.expert_cache_bytes = static_cast<std::size_t>(parse_nonnegative_int(
+                                             require_value("--expert-cache-gib"), "expert-cache-gib"))
+                                         << 30U;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {

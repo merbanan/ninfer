@@ -15,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -47,6 +48,9 @@ constexpr ReductionCriterion kSparseMoeA16Tolerance{
     /*gross_absolute*/ 4.0e-3,
     /*gross_relative_to_max_reference*/ 0.0,
 };
+
+// Offloaded-expert banks: fewer slots than experts, and every expert in a slot other than its id.
+constexpr std::int32_t kOffloadBanks = 12;
 
 constexpr std::size_t kOutputGuardBytes = 256;
 constexpr std::uint8_t kOutputGuardByte = 0xa5;
@@ -142,6 +146,12 @@ public:
         scales_.copy_from_host(source.payload.data() + source.scale_plane_offset,
                                static_cast<std::size_t>(source_rows) * scale_row_bytes_,
                                static_cast<std::size_t>(destination_row) * scale_row_bytes_);
+    }
+
+    void clear() {
+        codes_.fill(0);
+        scales_.fill(0);
+        if (high_) { high_->fill(0); }
     }
 
     Weight weight() const {
@@ -450,6 +460,12 @@ public:
           routed_down_(profile.routed_down, kRoutedDownRows, kIntermediate),
           shared_gate_(QType::W8G32_F16S, kSharedGateRows, kHidden),
           shared_down_device_(QType::W8G32_F16S, kHidden, kIntermediate) {
+        if (profile.routed_gate_up == QType::Q4G64_F16S) {
+            offload_gate_ = std::make_unique<DeviceRowSplit>(
+                profile.routed_gate_up, kOffloadBanks * kExpertGateRows, kHidden);
+            offload_down_ = std::make_unique<DeviceRowSplit>(profile.routed_down,
+                                                             kOffloadBanks * kHidden, kIntermediate);
+        }
         for (int pattern = 0; pattern < static_cast<int>(kRoutePatterns.size()); ++pattern) {
             inputs_.push_back(make_input(pattern));
             residuals_.push_back(make_residual(pattern));
@@ -493,8 +509,11 @@ public:
         }
     }
 
-    int run(std::int32_t tokens, int first_pattern, bool graph_replay) {
-        const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens);
+    // offloaded: the routed banks hold kOffloadBanks slots, start zeroed, and are filled only by
+    // the residency's acquire, with every expert placed in a slot other than its id.
+    int run(std::int32_t tokens, int first_pattern, bool graph_replay, bool offloaded = false) {
+        const std::string label = std::string(profile_.name) + (offloaded ? " offloaded" : "") +
+                                  " T=" + std::to_string(tokens);
         std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<float> residual(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<double> reference(static_cast<std::size_t>(kHidden) * tokens);
@@ -519,8 +538,8 @@ public:
 
         const ops::SparseMoeWeights weights{
             dense_bf16_weight(device_router_.p, kExperts + 1, kHidden),
-            routed_gate_.weight(),
-            routed_down_.weight(),
+            offloaded ? offload_gate_->weight() : routed_gate_.weight(),
+            offloaded ? offload_down_->weight() : routed_down_.weight(),
             shared_gate_.weight(),
             shared_down_device_.weight(),
         };
@@ -530,7 +549,52 @@ public:
             weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
         WorkspaceArena workspace(workspace_bytes);
 
-        if (graph_replay) {
+        std::set<int> expected_experts;
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const RoutePattern& route =
+                kRoutePatterns[(first_pattern + token) % static_cast<int>(kRoutePatterns.size())];
+            expected_experts.insert(route.selected.begin(), route.selected.end());
+        }
+        std::set<int> requested_experts;
+        int residency_failures = 0;
+        if (offloaded) {
+            offload_gate_->clear();
+            offload_down_->clear();
+            std::int32_t* host_ids   = nullptr;
+            std::int32_t* host_banks = nullptr;
+            cuda_check(cudaMallocHost(&host_ids, sizeof(std::int32_t) * kTopK * tokens), "pin ids");
+            cuda_check(cudaMallocHost(&host_banks, sizeof(std::int32_t) * kExperts), "pin banks");
+            std::vector<bool> staged(kExperts, false);
+            ops::SparseMoeExpertResidency residency{
+                .host_ids            = host_ids,
+                .host_bank_of_expert = host_banks,
+                .banks               = kOffloadBanks,
+                .acquire =
+                    [&](std::span<const std::int32_t> selected, std::int32_t* bank_of_expert,
+                        cudaStream_t) {
+                        for (const std::int32_t expert : selected) {
+                            requested_experts.insert(expert);
+                            const int slot = offload_slot(expert);
+                            if (slot < 0) {
+                                ++residency_failures;
+                                continue;
+                            }
+                            if (!staged[expert]) {
+                                const HostExpert& host = find_expert(experts_, expert);
+                                offload_gate_->copy_rows(host.gate_up, slot * kExpertGateRows);
+                                offload_down_->copy_rows(host.down, slot * kHidden);
+                                staged[expert] = true;
+                            }
+                            bank_of_expert[expert] = slot;
+                        }
+                    },
+            };
+            ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, residency,
+                            workspace, nullptr);
+            cuda_synchronize();
+            cuda_check(cudaFreeHost(host_ids), "free ids");
+            cuda_check(cudaFreeHost(host_banks), "free banks");
+        } else if (graph_replay) {
             cudaStream_t stream  = nullptr;
             cudaGraph_t graph    = nullptr;
             cudaGraphExec_t exec = nullptr;
@@ -559,6 +623,10 @@ public:
         }
 
         int failures = compare_output(label, destination_storage.values(), reference);
+        if (offloaded && (requested_experts != expected_experts || residency_failures != 0)) {
+            std::cerr << label << ": residency saw a different selected-expert set\n";
+            ++failures;
+        }
         failures += destination_storage.verify_guards(label);
         failures +=
             verify_exact((label + " input preservation").c_str(),
@@ -569,6 +637,8 @@ public:
         }
         return failures;
     }
+
+    [[nodiscard]] bool supports_offload() const noexcept { return offload_gate_ != nullptr; }
 
     int verify_persistent_inputs() const {
         int failures = 0;
@@ -605,6 +675,18 @@ private:
     quantized_weight::PackedWeight shared_gate_host_;
     quantized_weight::PackedWeight shared_down_host_;
     std::vector<std::vector<double>> references_;
+    std::unique_ptr<DeviceRowSplit> offload_gate_;
+    std::unique_ptr<DeviceRowSplit> offload_down_;
+
+    // Populated expert i (in id order) lives in slot (5i + 3) mod kOffloadBanks.
+    int offload_slot(int expert) const {
+        for (std::size_t i = 0; i < experts_.size(); ++i) {
+            if (experts_[i].id == expert) {
+                return static_cast<int>((5 * i + 3) % static_cast<std::size_t>(kOffloadBanks));
+            }
+        }
+        return -1;
+    }
 };
 
 int run_profile(const CodecProfile& profile) {
@@ -620,6 +702,9 @@ int run_profile(const CodecProfile& profile) {
         // high/low expert ids, and a different ordering of the same experts.
         failures +=
             fixture.run(tokens, index == 0 ? 1 : 0, profile.verify_graph_replay && index == 1);
+        if (fixture.supports_offload()) {
+            failures += fixture.run(tokens, index == 0 ? 1 : 0, false, true);
+        }
     }
     const std::size_t interval = ops::sparse_moe_workspace_capacity_bytes(
         profile.routed_gate_up, profile.routed_down, 1, profile.token_cases.back());

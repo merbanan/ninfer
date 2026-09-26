@@ -234,6 +234,10 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, const ::ninfer::ops::SparseMoeHints& hints,
                          WorkspaceArena& workspace, cudaStream_t stream) {
+    if (weights.offload != nullptr) {
+        weights.offload->sparse_moe(weights.layer, hidden, weights.op, residual, workspace, stream);
+        return;
+    }
     run_sparse_moe(hidden, weights.op, residual, hints, workspace, stream);
 }
 

@@ -136,7 +136,9 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
     ranges.push_back(address_range(weight.scales, scale_bytes, std::string(name) + " scales"));
 }
 
-void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges) {
+// `banks` is the number of experts the routed banks hold: 256, or fewer/more when offloaded.
+void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges,
+                      std::int32_t banks = kExperts) {
     require_router(weights.router_shared_gate, ranges);
     if (weights.routed_gate_up.qtype != QType::Q4G64_F16S &&
         weights.routed_gate_up.qtype != QType::W8G32_F16S) {
@@ -151,8 +153,8 @@ void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>
         weights.shared_down.qtype != QType::W8G32_F16S) {
         throw std::invalid_argument("sparse_moe: shared weights must be W8");
     }
-    require_quantized(weights.routed_gate_up, kRoutedGateRows, kHidden, "routed_gate_up", ranges);
-    require_quantized(weights.routed_down, kRoutedDownRows, kIntermediate, "routed_down", ranges);
+    require_quantized(weights.routed_gate_up, banks * kExpertRows, kHidden, "routed_gate_up", ranges);
+    require_quantized(weights.routed_down, banks * kHidden, kIntermediate, "routed_down", ranges);
     require_quantized(weights.shared_gate_up, kSharedGateRows, kHidden, "shared_gate_up", ranges);
     require_quantized(weights.shared_down, kHidden, kIntermediate, "shared_down", ranges);
 }
@@ -213,8 +215,11 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
 #endif // NINFER_VOLTA_BUILD
 }
 
-void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
-                Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream) {
+namespace {
+
+void run_sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                    Tensor& destination, const SparseMoeExpertResidency* residency,
+                    WorkspaceArena& workspace, cudaStream_t stream) {
     if (epilogue != SparseMoeEpilogue::AddResidual) {
         throw std::invalid_argument("sparse_moe: unsupported epilogue");
     }
@@ -227,7 +232,21 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     ranges.reserve(16);
     ranges.push_back(address_range(x.data, x.bytes(), "x"));
     ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
-    validate_weights(weights, ranges);
+    if (residency != nullptr) {
+#ifndef NINFER_VOLTA_BUILD
+        throw std::invalid_argument("sparse_moe: offloaded experts need the sm_70 build");
+#else
+        // 2^31 / 1 MiB of Q4 gate/up codes per expert keeps every 32-bit row index valid.
+        if (residency->banks < 1 || residency->banks > 2047 || residency->host_ids == nullptr ||
+            residency->host_bank_of_expert == nullptr || !residency->acquire ||
+            weights.routed_gate_up.qtype != QType::Q4G64_F16S ||
+            (weights.routed_down.qtype != QType::Q5G64_F16S &&
+             weights.routed_down.qtype != QType::Q6G64_F16S)) {
+            throw std::invalid_argument("sparse_moe: invalid offloaded-expert residency");
+        }
+#endif
+    }
+    validate_weights(weights, ranges, residency != nullptr ? residency->banks : kExperts);
 
     const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
 #ifdef NINFER_VOLTA_BUILD
@@ -288,13 +307,14 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
                 const detail::SparseMoeSmallTWorkspace views =
                     detail::allocate_sparse_moe_small_t_workspace(workspace, count);
                 detail::sparse_moe_small_t_launch(x_chunk, weights, destination_chunk, plan, views,
-                                                  stream);
+                                                  stream, residency);
             } else {
                 const detail::SparseMoeDecodePlan plan = detail::resolve_sparse_moe_decode_plan(
                     weights.routed_gate_up.qtype, weights.routed_down.qtype);
                 const detail::SparseMoeDecodeWorkspace views =
                     detail::allocate_sparse_moe_decode_workspace(workspace);
-                detail::sparse_moe_decode_launch(x_chunk, weights, destination_chunk, views, stream);
+                detail::sparse_moe_decode_launch(x_chunk, weights, destination_chunk, views, stream,
+                                                 residency);
             }
         }
         return;
@@ -304,7 +324,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
             tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
         const detail::SparseMoePrefillWorkspace views =
             detail::allocate_sparse_moe_prefill_workspace(workspace, plan.slice_tokens);
-        detail::sparse_moe_prefill_launch(x, weights, destination, plan, views, stream);
+        detail::sparse_moe_prefill_launch(x, weights, destination, plan, views, stream, residency);
         return;
     }
     if (use_small_t) {
@@ -312,7 +332,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
             tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
         const detail::SparseMoeSmallTWorkspace views =
             detail::allocate_sparse_moe_small_t_workspace(workspace, tokens);
-        detail::sparse_moe_small_t_launch(x, weights, destination, plan, views, stream);
+        detail::sparse_moe_small_t_launch(x, weights, destination, plan, views, stream, residency);
         return;
     }
 
@@ -323,8 +343,22 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     for (std::int32_t token = 0; token < tokens; ++token) {
         const Tensor x_column     = x.slice(1, token, 1);
         Tensor destination_column = destination.slice(1, token, 1);
-        detail::sparse_moe_decode_launch(x_column, weights, destination_column, views, stream);
+        detail::sparse_moe_decode_launch(x_column, weights, destination_column, views, stream,
+                                         residency);
     }
+}
+
+} // namespace
+
+void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream) {
+    run_sparse_moe(x, weights, epilogue, destination, nullptr, workspace, stream);
+}
+
+void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                Tensor& destination, const SparseMoeExpertResidency& residency,
+                WorkspaceArena& workspace, cudaStream_t stream) {
+    run_sparse_moe(x, weights, epilogue, destination, &residency, workspace, stream);
 }
 
 // SparseMoeHints are pure L2-prefetch hints with no numeric effect (see the contract header); the

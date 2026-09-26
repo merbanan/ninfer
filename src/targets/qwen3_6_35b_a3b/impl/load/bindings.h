@@ -10,6 +10,7 @@
 #include "artifact/materializer.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"
+#include "targets/qwen3_6_35b_a3b/impl/expert_offload.h"
 
 #include <array>
 #include <cstddef>
@@ -88,6 +89,10 @@ struct DFlashPlan {
 
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
+    // Routed Text experts stay in the file mapping for ExpertOffload instead of device memory.
+    bool offload_experts                = false;
+    std::size_t expert_cache_bytes      = 0;
+    std::int32_t offload_max_tokens     = 0;
     qwen3_6::StartupFeatures features;
     artifact::ObjectHandle token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
@@ -109,10 +114,20 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features);
+struct ExpertOffloadOptions {
+    bool enabled               = false;
+    std::size_t cache_bytes    = 0; // zero: sized from free device memory at Program creation
+    std::int32_t max_tokens    = 0; // widest SparseMoe call (prefill chunk or decode batch)
+};
+
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               ExpertOffloadOptions offload = {});
 
 struct SparseMoePayload {
     ops::SparseMoeWeights op;
+    // Set for Text layers whose routed experts are offloaded; `op` then carries no routed banks.
+    ExpertOffload* offload = nullptr;
+    std::size_t layer      = 0;
 };
 
 struct AttentionProjectionPayload {
@@ -147,6 +162,7 @@ public:
 
     artifact::MaterializedArtifact backing;
     qwen3_6::FrontendResources frontend;
+    std::unique_ptr<ExpertOffload> offload;
     RuntimeModelView runtime;
 };
 

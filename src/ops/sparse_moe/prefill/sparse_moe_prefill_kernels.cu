@@ -1,3 +1,4 @@
+#include "ops/sparse_moe/sparse_moe_residency.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
 #include "core/device.h"
@@ -1145,7 +1146,8 @@ __global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_q4_gate_up_si
     const __nv_bfloat16* __restrict__ gathered, const int* __restrict__ expert_offsets,
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
     const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ activation) {
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ activation,
+    const int* __restrict__ bank_of_expert) {
     constexpr int kRowsPerWarp  = kSimtRowsPerCta / kSimtWarps; // 4
     constexpr int kColsPerLane  = BN / 32;
     constexpr int kGroupsPerRow = kHidden / kSimtTileK;
@@ -1198,7 +1200,8 @@ __global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_q4_gate_up_si
                 const int chunk     = idx % (kSimtTileK / 8);
                 const int gu        = (idx / (kSimtTileK / 8)) % 2;
                 const int row_local = idx / ((kSimtTileK / 8) * 2);
-                const std::int64_t row = static_cast<std::int64_t>(expert) * kExpertRows +
+                const int bank         = bank_of_expert != nullptr ? bank_of_expert[expert] : expert;
+                const std::int64_t row = static_cast<std::int64_t>(bank) * kExpertRows +
                                          (gu != 0 ? kIntermediate : 0) + row0 + row_local;
                 float w[8];
                 simt_decode_q4_row(codes, scales, row, group, chunk, w);
@@ -1285,7 +1288,7 @@ __global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_qx_down_simt_
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
     const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ output) {
+    __nv_bfloat16* __restrict__ output, const int* __restrict__ bank_of_expert) {
     constexpr int kRowsPerWarp  = kSimtRowsPerCta / kSimtWarps;
     constexpr int kColsPerLane  = BN / 32;
     constexpr int kGroupsPerRow = kIntermediate / kSimtTileK;
@@ -1331,7 +1334,8 @@ __global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_qx_down_simt_
             for (int idx = tid; idx < kSimtRowsPerCta * (kSimtTileK / 8); idx += kSimtThreads) {
                 const int chunk        = idx % (kSimtTileK / 8);
                 const int row_local    = idx / (kSimtTileK / 8);
-                const std::int64_t row = static_cast<std::int64_t>(expert) * kHidden + row0 +
+                const int bank         = bank_of_expert != nullptr ? bank_of_expert[expert] : expert;
+                const std::int64_t row = static_cast<std::int64_t>(bank) * kHidden + row0 +
                                          row_local;
                 const std::int64_t group_index = row * kGroupsPerRow + group;
                 float w[8];
@@ -1698,7 +1702,15 @@ __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict
 
 void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
-                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
+                               const SparseMoeExpertResidency* residency) {
+#ifndef NINFER_VOLTA_BUILD
+    if (residency != nullptr) {
+        throw std::invalid_argument("sparse_moe prefill: offloaded experts need the sm_70 build");
+    }
+#endif
+    auto* bank_of_expert = residency != nullptr ? static_cast<int*>(workspace.bank_of_expert.data)
+                                                : nullptr;
     if (x.ne[1] != plan.tokens || destination.ne[1] != plan.tokens || plan.slice_tokens < 1) {
         throw std::invalid_argument("sparse_moe prefill: launch plan does not match tensors");
     }
@@ -1749,7 +1761,8 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         const int adaptive_last = weights.routed_down.qtype == QType::Q5G64_F16S   ? 51
                                   : weights.routed_down.qtype == QType::Q6G64_F16S ? 52
                                                                                    : 0;
-        const bool adaptive     = tokens >= 47 && tokens <= adaptive_last;
+        // The adaptive route reads routed rows through ids; offloaded experts take the grouped one.
+        const bool adaptive = residency == nullptr && tokens >= 47 && tokens <= adaptive_last;
 
 #ifdef NINFER_VOLTA_BUILD
         {
@@ -1770,6 +1783,9 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         sparse_moe_prefill_select_count_kernel<<<route_tiles, kRouterThreads, 0, stream>>>(
             scores, ids, alpha, shared_scale, local_rank, tile_counts, tokens);
         CUDA_CHECK(cudaGetLastError());
+        if (residency != nullptr) {
+            resolve_sparse_moe_residency(*residency, ids, assignments, false, bank_of_expert, stream);
+        }
 
 #ifdef NINFER_VOLTA_BUILD
         // Eight assignments over 256 experts average one packed column per 32
@@ -1836,12 +1852,12 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                 sparse_moe_prefill_q4_gate_up_simt_kernel<64>
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
-                        routed_gate_codes, routed_gate_scales, routed_activation);
+                        routed_gate_codes, routed_gate_scales, routed_activation, bank_of_expert);
             } else {
                 sparse_moe_prefill_q4_gate_up_simt_kernel<32>
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
-                        routed_gate_codes, routed_gate_scales, routed_activation);
+                        routed_gate_codes, routed_gate_scales, routed_activation, bank_of_expert);
             }
         } else {
             throw std::invalid_argument(
@@ -1914,13 +1930,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
+                        grouped_io, bank_of_expert);
             } else {
                 sparse_moe_prefill_qx_down_simt_kernel<SimtQ5Decode, 32>
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
+                        grouped_io, bank_of_expert);
             }
             break;
         case QType::Q6G64_F16S:
@@ -1929,13 +1945,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
+                        grouped_io, bank_of_expert);
             } else {
                 sparse_moe_prefill_qx_down_simt_kernel<SimtQ6Decode, 32>
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
+                        grouped_io, bank_of_expert);
             }
             break;
         default:

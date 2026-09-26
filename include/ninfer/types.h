@@ -171,6 +171,11 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    // Keep routed MoE experts in host memory and stream them into a device expert cache
+    // (qwen3.6-35b-a3b, sm_70 build). Disables CUDA Graph execution. Zero cache bytes selects the
+    // device memory left after the model and runtime allocations.
+    bool offload_routed_experts          = false;
+    std::size_t routed_expert_cache_bytes = 0;
     bool quantize_output_head_fp8           = false;
     bool quantize_token_embedding_fp8       = false;
     bool use_qsa_prefill_mma                = true;

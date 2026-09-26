@@ -47,6 +47,8 @@ struct ServeOptions {
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
+    bool offload_experts = false;
+    std::size_t expert_cache_bytes = 0;
     bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)

@@ -270,6 +270,7 @@ add_library(ninfer_ops STATIC
   ops/linear_topk/merge.cu
   ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
   ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
+  ops/sparse_moe/sparse_moe_residency.cpp
   ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
   ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
   ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu

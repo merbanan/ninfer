@@ -2,7 +2,9 @@
 
 #include "artifact/typed_binding.h"
 
+#include <array>
 #include <cstddef>
+#include <span>
 #include <cstdint>
 #include <initializer_list>
 #include <stdexcept>
@@ -43,18 +45,43 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
 }
 
 MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFormat routed_gate_up,
-                 NumericFormat routed_down, artifact::TensorPlacement placement) {
+                 NumericFormat routed_down, artifact::TensorPlacement placement,
+                 bool routed_on_host = false) {
     const auto bind = [&](std::string_view name, NumericFormat format,
                           std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, placement);
     };
+    const auto bind_routed = [&](std::string_view name, NumericFormat format,
+                                 std::initializer_list<std::uint64_t> shape) {
+        if (!routed_on_host) { return bind(name, format, shape); }
+        const artifact::ObjectHandle handle = binder.require_tensor(
+            name, format, artifact::StorageLayout::RowSplitK128V1,
+            std::span<const std::uint64_t>(shape.begin(), shape.size()));
+        binder.retain_mapped_tensor(handle);
+        return handle;
+    };
     return MoePlan{
         .router_shared_gate = bind(prefix + "router_shared_gate", NumericFormat::BF16, {257, 2048}),
-        .routed_gate_up     = bind(prefix + "routed_gate_up", routed_gate_up, {262144, 2048}),
-        .routed_down        = bind(prefix + "routed_down", routed_down, {524288, 512}),
+        .routed_gate_up     = bind_routed(prefix + "routed_gate_up", routed_gate_up, {262144, 2048}),
+        .routed_down        = bind_routed(prefix + "routed_down", routed_down, {524288, 512}),
         .shared_gate_up = bind(prefix + "shared_gate_up", NumericFormat::W8G32_F16S, {1024, 2048}),
         .shared_down    = bind(prefix + "shared_down", NumericFormat::W8G32_F16S, {2048, 512}),
     };
+}
+
+// Offloaded layers carry only the router and shared expert; ExpertOffload supplies routed banks.
+SparseMoePayload load_offloaded_moe(const MoePlan& plan, const artifact::MaterializedArtifact& materialized,
+                                    ExpertOffload& offload, std::size_t layer) {
+    SparseMoePayload out{};
+    out.op.router_shared_gate = artifact::materialized_weight(materialized, plan.router_shared_gate,
+                                                              NumericFormat::BF16, 257, 2048);
+    out.op.shared_gate_up     = artifact::materialized_weight(materialized, plan.shared_gate_up,
+                                                              NumericFormat::W8G32_F16S, 1024, 2048);
+    out.op.shared_down        = artifact::materialized_weight(materialized, plan.shared_down,
+                                                              NumericFormat::W8G32_F16S, 2048, 512);
+    out.offload               = &offload;
+    out.layer                 = layer;
+    return out;
 }
 
 SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtifact& materialized,
@@ -94,10 +121,14 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 } // namespace
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features) {
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               ExpertOffloadOptions offload) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
     out.frontend        = qwen3_6::bind_frontend_resources(binder);
+    out.offload_experts    = offload.enabled;
+    out.expert_cache_bytes = offload.cache_bytes;
+    out.offload_max_tokens = offload.max_tokens;
     out.features        = features;
     out.token_embedding = artifact::bind_device_tensor(binder, "text/token_embedding",
                                                        NumericFormat::W8G32_F16S, {248320, 2048});
@@ -137,7 +168,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {2048});
         target.moe = bind_moe(binder, prefix + "moe/", NumericFormat::Q4G64_F16S,
-                              routed_down_format(layer), artifact::TensorPlacement::Device);
+                              routed_down_format(layer), artifact::TensorPlacement::Device,
+                              offload.enabled);
     }
 
     out.final_norm =
@@ -226,6 +258,23 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
+    if (plan.offload_experts) {
+        std::array<HostRoutedBanks, kOffloadTextLayers> banks{};
+        for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+            const MoePlan& moe = plan.text_layers[layer].moe;
+            banks[layer]       = HostRoutedBanks{
+                      .down_format = routed_down_format(layer),
+                      .gate_up     = backing.mapped_tensor_bytes(moe.routed_gate_up),
+                      .down        = backing.mapped_tensor_bytes(moe.routed_down),
+            };
+        }
+        offload = std::make_unique<ExpertOffload>(banks, plan.expert_cache_bytes, plan.offload_max_tokens);
+    }
+    const auto text_moe = [&](const MoePlan& moe, std::size_t layer) {
+        return offload != nullptr
+                   ? load_offloaded_moe(moe, backing, *offload, layer)
+                   : load_moe(moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer));
+    };
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
@@ -257,8 +306,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                               NumericFormat::W8G32_F16S, 2048, 4096);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {2048});
-            target.post_mixer =
-                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer));
+            target.post_mixer = text_moe(source.moe, layer);
         } else {
             GdnWeights& target = gdn_layers.at(gdn_index++);
             target.input_norm  = artifact::materialized_tensor(backing, source.input_norm,
@@ -279,8 +327,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                                        NumericFormat::W8G32_F16S, 2048, 4096);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {2048});
-            target.post_mixer =
-                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer));
+            target.post_mixer = text_moe(source.moe, layer);
         }
     }
     if (full_index != full_layers.size() || gdn_index != gdn_layers.size()) {

@@ -784,6 +784,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--offload-experts` | Qwen3.6-35B-A3B, sm_70 build: keep routed experts in host memory behind a device expert cache (disables CUDA Graphs) | off |
+| `--expert-cache-gib N` | fixed expert-cache size; implies `--offload-experts` | memory left after startup |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |

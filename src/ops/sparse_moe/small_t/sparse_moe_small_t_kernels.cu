@@ -1,3 +1,4 @@
+#include "ops/sparse_moe/sparse_moe_residency.h"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include "core/device.h"
@@ -335,7 +336,8 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 
 void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
-                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
+                               const SparseMoeExpertResidency* residency) {
     dispatch_tokens(plan.tokens, [&]<int Tokens>() {
         launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(x.data),
                           static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
@@ -345,6 +347,10 @@ void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                           static_cast<float*>(workspace.token_alpha.data),
                           static_cast<float*>(workspace.shared_scale.data), stream);
     });
+    if (residency != nullptr) {
+        resolve_sparse_moe_residency(*residency, static_cast<int*>(workspace.token_ids.data),
+                                     plan.tokens * kTopK, true, nullptr, stream);
+    }
     launch_s3_tiled(x, weights, plan, workspace, stream);
     launch_s4_tiled(weights, destination, plan, workspace, stream);
 }

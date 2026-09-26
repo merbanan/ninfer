@@ -209,6 +209,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--offload-experts` | Qwen3.6-35B-A3B, sm_70 build: keep routed experts in host memory behind a device expert cache (disables CUDA Graphs) | off |
+| `--expert-cache-gib N` | fixed expert-cache size; implies `--offload-experts` | memory left after startup |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |

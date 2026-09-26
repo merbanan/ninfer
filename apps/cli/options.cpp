@@ -88,7 +88,7 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--no-cuda-graph] [--offload-experts] [--expert-cache-gib N]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -158,6 +158,12 @@ Options parse_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--offload-experts") {
+            options.offload_experts = true;
+        } else if (arg == "--expert-cache-gib") {
+            options.offload_experts    = true;
+            options.expert_cache_bytes =
+                static_cast<std::size_t>(parse_u32(value(arg), "expert-cache-gib")) << 30U;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

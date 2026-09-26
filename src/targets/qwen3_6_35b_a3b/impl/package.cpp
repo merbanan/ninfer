@@ -6,6 +6,8 @@
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
 #include "targets/qwen3_6_35b_a3b/impl/variant.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
@@ -40,6 +42,21 @@ LoadedModel::~LoadedModel() = default;
 namespace ninfer::targets::qwen3_6_35b_a3b {
 namespace {
 
+// Device memory the expert cache leaves to allocations made after Program creation (CUDA
+// context growth, cuBLAS/CUTLASS handles, transient host-pinned staging) when sized automatically.
+constexpr std::size_t kOffloadHeadroomBytes = 384ULL << 20;
+
+// Offloaded experts need a host synchronization inside every SparseMoe call, which CUDA Graph
+// capture cannot contain.
+EngineOptions effective_options(const EngineOptions& options) {
+    EngineOptions out = options;
+    if (options.offload_routed_experts || options.routed_expert_cache_bytes != 0) {
+        out.offload_routed_experts = true;
+        out.use_cuda_graph         = false;
+    }
+    return out;
+}
+
 constexpr ModelSamplingDefaults kQwen3_6_35BA3BDefaults{
     .thinking     = {.temperature       = 1.0F,
                      .top_k             = 20,
@@ -72,10 +89,22 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
-Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
+Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options_in,
                                      WeightsProfile weights_profile) {
+    const EngineOptions options = effective_options(options_in);
+    detail::ExpertOffloadOptions offload{};
+    if (options.offload_routed_experts) {
+#ifndef NINFER_VOLTA_BUILD
+        throw std::invalid_argument("--offload-experts requires the sm_70 build");
+#endif
+        offload.enabled     = true;
+        offload.cache_bytes = options.routed_expert_cache_bytes;
+        // Widest SparseMoe call: a prefill chunk, a verified draft window, or one decode round.
+        offload.max_tokens = static_cast<std::int32_t>(std::max<std::uint32_t>(
+            {options.prefill_chunk, options.max_concurrency * (options.speculative.draft_tokens + 1), 1U}));
+    }
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile, detail::bind_artifact(binder, qwen3_6::startup_features(options))));
+        weights_profile, detail::bind_artifact(binder, qwen3_6::startup_features(options), offload)));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -102,7 +131,8 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile) {
-    return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
+    return qwen3_6::make_sequence_planner<detail::Variant>(device, effective_options(options),
+                                                           weights_profile);
 }
 
 std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& model,
@@ -110,9 +140,21 @@ std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& mod
                                                           DeviceContext& device,
                                                           const StartupObserver& startup_observer) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime,
-                                                    model.impl_->weights_profile, std::move(plan),
-                                                    device, startup_observer);
+    auto program = qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime,
+                                                            model.impl_->weights_profile,
+                                                            std::move(plan), device, startup_observer);
+    if (detail::ExpertOffload* offload = model.impl_->data.offload.get(); offload != nullptr) {
+        // The cache takes what the weights and the Program's runtime reservation leave.
+        std::size_t budget = offload->requested_bytes();
+        if (budget == 0) {
+            device.synchronize();
+            std::size_t free_bytes = 0, total_bytes = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+            budget = free_bytes > kOffloadHeadroomBytes ? free_bytes - kOffloadHeadroomBytes : 0;
+        }
+        offload->allocate(budget);
+    }
+    return program;
 }
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b
