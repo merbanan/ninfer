@@ -1941,7 +1941,8 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         // BN as the scan was told to use, so the column tiling matches exactly.
         const int max_route_jobs = assignments / 32 + 256;
         const int tiles_per_job  = route_job_bn / kMmaTile;
-        const bool mma           = prefill_mma_enabled() && weights.routed_gate_up.qtype == QType::Q4G64_F16S;
+        const bool mma           = prefill_mma_enabled() && !adaptive &&
+                                   weights.routed_gate_up.qtype == QType::Q4G64_F16S;
         if (mma) {
             auto* gate_up_out = static_cast<__nv_bfloat16*>(workspace.routed_gate_up.data);
             sparse_moe_prefill_q4_gate_up_mma_kernel<<<dim3(2 * kIntermediate / Q4VoltaMmaSchedule::kRowsPerCta, 1,
