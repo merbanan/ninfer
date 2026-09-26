@@ -39,6 +39,7 @@ struct SparseMoeSmallTWorkspace {
     Tensor token_alpha;
     Tensor shared_scale;
     Tensor scratch;
+    Tensor cold_sum; // host-computed cold-expert sums [2048, T] FP32 (offloaded experts only)
 };
 
 template <class Arena>
@@ -51,6 +52,7 @@ SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena, std
     // S1 uses [T,257,4] partial router scores. After S2, each token reuses
     // its [9,512] region for eight routed and one shared SwiGLU activations.
     out.scratch = arena.alloc(DType::FP32, {512, 9 * tokens}, 256);
+    out.cold_sum = arena.alloc(DType::FP32, {2048, tokens}, 256);
     return out;
 }
 

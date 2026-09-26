@@ -23,6 +23,7 @@ struct SparseMoeDecodeWorkspace {
     Tensor alpha;
     Tensor shared_scale;
     Tensor scratch;
+    Tensor cold_sum; // host-computed cold-expert sum [2048] FP32 (offloaded experts only)
 };
 
 template <class Arena>
@@ -33,7 +34,8 @@ SparseMoeDecodeWorkspace allocate_sparse_moe_decode_workspace(Arena& arena) {
     out.shared_scale = arena.alloc(DType::FP32, {1}, 4);
     // D1 uses the first 257 values as scores. D3 then reuses the same lifetime for [9,512]
     // natural FP32 SwiGLU results consumed by D4.
-    out.scratch = arena.alloc(DType::FP32, {9, 512}, 256);
+    out.scratch  = arena.alloc(DType::FP32, {9, 512}, 256);
+    out.cold_sum = arena.alloc(DType::FP32, {2048}, 256);
     return out;
 }
 
@@ -51,7 +53,8 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                          const float* shared_scale, const float* token_activations,
                                          std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                          cudaStream_t stream,
-                                         const int* adaptive_route_jobs = nullptr);
+                                         const int* adaptive_route_jobs = nullptr,
+                                         const float* addend            = nullptr);
 // A non-null residency synchronizes once after routing and reads routed rows from its banks.
 void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,

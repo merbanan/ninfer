@@ -178,12 +178,13 @@ void launch_s3_tiled(const Tensor& x, const SparseMoeWeights& weights,
 
 void launch_s4_tiled(const SparseMoeWeights& weights, Tensor& destination,
                      const SparseMoeSmallTPlan& plan, const SparseMoeSmallTWorkspace& workspace,
-                     cudaStream_t stream) {
+                     cudaStream_t stream, const float* addend) {
     sparse_moe_decode_launch_d4_small_t(
         weights, destination, static_cast<const int*>(workspace.token_ids.data),
         static_cast<const float*>(workspace.token_alpha.data),
         static_cast<const float*>(workspace.shared_scale.data),
-        static_cast<const float*>(workspace.scratch.data), plan.tokens, plan.d4_schedule, stream);
+        static_cast<const float*>(workspace.scratch.data), plan.tokens, plan.d4_schedule, stream,
+        nullptr, addend);
 }
 
 template <class Launch>
@@ -347,12 +348,22 @@ void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                           static_cast<float*>(workspace.token_alpha.data),
                           static_cast<float*>(workspace.shared_scale.data), stream);
     });
-    if (residency != nullptr) {
+    bool cold = false;
+    if (residency != nullptr && residency->cold_compute) {
+        cold = resolve_sparse_moe_residency_cold(*residency, static_cast<int*>(workspace.token_ids.data),
+                                                 static_cast<const float*>(workspace.token_alpha.data), x.data,
+                                                 plan.tokens, stream);
+    } else if (residency != nullptr) {
         resolve_sparse_moe_residency(*residency, static_cast<int*>(workspace.token_ids.data),
                                      plan.tokens * kTopK, true, nullptr, stream);
     }
     launch_s3_tiled(x, weights, plan, workspace, stream);
-    launch_s4_tiled(weights, destination, plan, workspace, stream);
+    // Host-computed cold experts overlap the device gate/up stage enqueued above.
+    if (cold) {
+        finish_sparse_moe_cold(*residency, plan.tokens, static_cast<float*>(workspace.cold_sum.data), stream);
+    }
+    launch_s4_tiled(weights, destination, plan, workspace, stream,
+                    cold ? static_cast<const float*>(workspace.cold_sum.data) : nullptr);
 }
 
 } // namespace ninfer::ops::detail

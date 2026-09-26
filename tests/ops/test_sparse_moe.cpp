@@ -1,4 +1,5 @@
 #include "ninfer/ops/sparse_moe.h"
+#include "ops/sparse_moe/cpu/sparse_moe_cpu.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -50,7 +51,24 @@ constexpr ReductionCriterion kSparseMoeA16Tolerance{
 };
 
 // Offloaded-expert banks: fewer slots than experts, and every expert in a slot other than its id.
+// Slot 0 is never filled and serves as the all-zero bank for host-computed cold experts.
 constexpr std::int32_t kOffloadBanks = 12;
+constexpr std::int32_t kZeroBank     = 0;
+
+enum class Residency { Resident, Offloaded, OffloadedCold };
+
+// Host view of one test expert for the production CPU cold-expert kernels.
+ops::cpu::HostExpertView host_view(const quantized_weight::PackedWeight& gate_up,
+                                   const quantized_weight::PackedWeight& down) {
+    return {
+        .gate_codes  = gate_up.payload.data(),
+        .gate_scales = gate_up.payload.data() + gate_up.scale_plane_offset,
+        .down_codes  = down.payload.data(),
+        .down_high   = down.payload.data() + down.high_plane_offset,
+        .down_scales = down.payload.data() + down.scale_plane_offset,
+        .down_qtype  = down.weight.qtype,
+    };
+}
 
 constexpr std::size_t kOutputGuardBytes = 256;
 constexpr std::uint8_t kOutputGuardByte = 0xa5;
@@ -86,6 +104,13 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
 
 int compare_output(const std::string& label, const std::vector<double>& actual,
                    const std::vector<double>& reference) {
+    // NINFER_TEST_VERBOSE prints the error of every case, e.g. to compare residency modes.
+    if (std::getenv("NINFER_TEST_VERBOSE") != nullptr) {
+        const ReductionStats stats = compute_reduction_stats(actual.data(), reference.data(),
+                                                             static_cast<std::int64_t>(actual.size()));
+        std::cout << label << ": rel-L2 " << stats.relative_l2 << ", max abs " << stats.maximum_absolute_error
+                  << '\n';
+    }
     return verify_reduction(label, actual, reference, kSparseMoeA16Tolerance);
 }
 
@@ -511,8 +536,14 @@ public:
 
     // offloaded: the routed banks hold kOffloadBanks slots, start zeroed, and are filled only by
     // the residency's acquire, with every expert placed in a slot other than its id.
-    int run(std::int32_t tokens, int first_pattern, bool graph_replay, bool offloaded = false) {
-        const std::string label = std::string(profile_.name) + (offloaded ? " offloaded" : "") +
+    // OffloadedCold additionally leaves every other populated expert cold whenever the call admits
+    // host-computed experts; the production CPU kernels compute them.
+    int run(std::int32_t tokens, int first_pattern, bool graph_replay,
+            Residency residency_mode = Residency::Resident) {
+        const bool offloaded = residency_mode != Residency::Resident;
+        const bool with_cold = residency_mode == Residency::OffloadedCold;
+        const std::string label = std::string(profile_.name) +
+                                  (with_cold ? " offloaded+cold" : offloaded ? " offloaded" : "") +
                                   " T=" + std::to_string(tokens);
         std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<float> residual(static_cast<std::size_t>(kHidden) * tokens);
@@ -562,21 +593,33 @@ public:
             offload_down_->clear();
             std::int32_t* host_ids   = nullptr;
             std::int32_t* host_banks = nullptr;
-            cuda_check(cudaMallocHost(&host_ids, sizeof(std::int32_t) * kTopK * tokens), "pin ids");
+            float* host_alpha        = nullptr;
+            std::uint16_t* host_x    = nullptr;
+            float* host_cold         = nullptr;
+            cuda_check(cudaMallocHost(&host_ids, sizeof(std::int32_t) * 2 * kTopK * tokens), "pin ids");
             cuda_check(cudaMallocHost(&host_banks, sizeof(std::int32_t) * kExperts), "pin banks");
+            cuda_check(cudaMallocHost(&host_alpha, sizeof(float) * kTopK * tokens), "pin alpha");
+            cuda_check(cudaMallocHost(&host_x, sizeof(std::uint16_t) * kHidden * tokens), "pin x");
+            cuda_check(cudaMallocHost(&host_cold, sizeof(float) * kHidden * tokens), "pin cold");
             std::vector<bool> staged(kExperts, false);
+            ops::cpu::SpinPool pool(4);
+            int cold_experts_seen = 0;
             ops::SparseMoeExpertResidency residency{
                 .host_ids            = host_ids,
                 .host_bank_of_expert = host_banks,
                 .banks               = kOffloadBanks,
                 .acquire =
                     [&](std::span<const std::int32_t> selected, std::int32_t* bank_of_expert,
-                        cudaStream_t) {
+                        bool cold_allowed, cudaStream_t) {
                         for (const std::int32_t expert : selected) {
                             requested_experts.insert(expert);
                             const int slot = offload_slot(expert);
                             if (slot < 0) {
                                 ++residency_failures;
+                                continue;
+                            }
+                            if (with_cold && cold_allowed && offload_index(expert) % 2 == 1) {
+                                bank_of_expert[expert] = -1;
                                 continue;
                             }
                             if (!staged[expert]) {
@@ -589,11 +632,44 @@ public:
                         }
                     },
             };
+            if (with_cold) {
+                residency.zero_bank   = kZeroBank;
+                residency.host_alpha  = host_alpha;
+                residency.host_x      = host_x;
+                residency.host_cold_sum = host_cold;
+                residency.cold_compute = [&](std::span<const std::int32_t> selected, const float* alpha,
+                                             const std::uint16_t* x_bf16, std::int32_t columns,
+                                             const std::int32_t* bank_of_expert, float* cold_sum) {
+                    std::vector<ops::cpu::ColdExpertWork> work;
+                    std::vector<int> work_of_expert(kExperts, -1);
+                    for (std::size_t i = 0; i < selected.size(); ++i) {
+                        const int expert = selected[i];
+                        if (bank_of_expert[expert] != -1) { continue; }
+                        if (work_of_expert[expert] < 0) {
+                            const HostExpert& host = find_expert(experts_, expert);
+                            work_of_expert[expert] = static_cast<int>(work.size());
+                            work.push_back({host_view(host.gate_up, host.down), {}, {}});
+                            ++cold_experts_seen;
+                        }
+                        auto& item = work[static_cast<std::size_t>(work_of_expert[expert])];
+                        item.columns.push_back(static_cast<std::int32_t>(i / kTopK));
+                        item.weights.push_back(alpha[i]);
+                    }
+                    ops::cpu::cold_experts(work, x_bf16, columns, cold_sum, pool);
+                };
+            }
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, residency,
                             workspace, nullptr);
             cuda_synchronize();
-            cuda_check(cudaFreeHost(host_ids), "free ids");
-            cuda_check(cudaFreeHost(host_banks), "free banks");
+            if (with_cold && tokens <= 46 && cold_experts_seen == 0) {
+                std::cerr << label << ": no expert was computed on the host\n";
+                ++residency_failures;
+            }
+            for (void* pinned : {static_cast<void*>(host_ids), static_cast<void*>(host_banks),
+                                 static_cast<void*>(host_alpha), static_cast<void*>(host_x),
+                                 static_cast<void*>(host_cold)}) {
+                cuda_check(cudaFreeHost(pinned), "free pinned");
+            }
         } else if (graph_replay) {
             cudaStream_t stream  = nullptr;
             cudaGraph_t graph    = nullptr;
@@ -678,6 +754,13 @@ private:
     std::unique_ptr<DeviceRowSplit> offload_gate_;
     std::unique_ptr<DeviceRowSplit> offload_down_;
 
+    int offload_index(int expert) const {
+        for (std::size_t i = 0; i < experts_.size(); ++i) {
+            if (experts_[i].id == expert) { return static_cast<int>(i); }
+        }
+        return -1;
+    }
+
     // Populated expert i (in id order) lives in slot (5i + 3) mod kOffloadBanks.
     int offload_slot(int expert) const {
         for (std::size_t i = 0; i < experts_.size(); ++i) {
@@ -703,7 +786,8 @@ int run_profile(const CodecProfile& profile) {
         failures +=
             fixture.run(tokens, index == 0 ? 1 : 0, profile.verify_graph_replay && index == 1);
         if (fixture.supports_offload()) {
-            failures += fixture.run(tokens, index == 0 ? 1 : 0, false, true);
+            failures += fixture.run(tokens, index == 0 ? 1 : 0, false, Residency::Offloaded);
+            failures += fixture.run(tokens, index == 0 ? 1 : 0, false, Residency::OffloadedCold);
         }
     }
     const std::size_t interval = ops::sparse_moe_workspace_capacity_bytes(

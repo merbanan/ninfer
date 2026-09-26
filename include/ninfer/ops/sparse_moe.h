@@ -53,9 +53,25 @@ struct SparseMoeExpertResidency {
     std::int32_t* host_ids            = nullptr; // pinned host storage, >= 8 * T entries
     std::int32_t* host_bank_of_expert = nullptr; // pinned host storage, 256 entries
     std::int32_t banks                = 0;
+    // cold_allowed is true only for calls that can take host-computed ("cold") experts; acquire
+    // may then leave a selected expert cold by writing -1 for it.
     std::function<void(std::span<const std::int32_t> selected_ids, std::int32_t* bank_of_expert,
-                       cudaStream_t stream)>
+                       bool cold_allowed, cudaStream_t stream)>
         acquire;
+
+    // Host-computed cold experts (decode and small-T calls; unused when cold_compute is empty).
+    // zero_bank is a bank whose weights are all zero: cold experts are read from it on the device,
+    // contributing nothing there. cold_compute receives the selected ids, their route weights, the
+    // BF16 input columns, and the bank table, and writes into cold_sum[column * 2048 + row] the sum
+    // of weight * expert(x) over the cold experts only; the Op adds it before the final rounding.
+    std::int32_t zero_bank   = -1;
+    float* host_alpha        = nullptr; // pinned, >= 8 * T entries
+    std::uint16_t* host_x    = nullptr; // pinned, >= 2048 * T entries
+    float* host_cold_sum     = nullptr; // pinned, >= 2048 * T entries
+    std::function<void(std::span<const std::int32_t> selected_ids, const float* alpha,
+                       const std::uint16_t* x_bf16, std::int32_t tokens,
+                       const std::int32_t* bank_of_expert, float* cold_sum)>
+        cold_compute;
 };
 
 /**
