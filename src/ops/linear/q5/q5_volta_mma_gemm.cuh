@@ -27,6 +27,7 @@
 // at 4/8/16/32/48). Chunk size is not the invariant -- see q5_volta_mma_splits().
 
 #include "ops/common/volta_mma.cuh"
+#include "ops/common/turing_mma.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
@@ -36,7 +37,8 @@
 
 namespace ninfer::ops::detail {
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+// Compiled for sm_70 (Volta mma.m8n8k4) and sm_75 (Turing mma.m16n8k8, ops/common/turing_mma.cuh).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 750
 
 struct Q5VoltaMmaSchedule {
     static constexpr int kWarps  = 4;  // warps per CTA; each owns 8 output rows
@@ -166,7 +168,11 @@ __device__ __forceinline__ void q5_volta_mma_gemm_tile(
             *reinterpret_cast<const uint4*>(decoded);
     };
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+    float dt[2][4] = {};
+#else
     float d[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+#endif
 
     prefetch(kstart, carry);
     commit(carry, 0);
@@ -180,6 +186,9 @@ __device__ __forceinline__ void q5_volta_mma_gemm_tile(
         const bool has_next = nxt < kend;
         if (has_next) { prefetch(nxt, carry); }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+        turing_tile_mma_step<S::kKStep, S::kKStep + S::kXPad>(dt, &x_sh[buf][0][0], &w_sh[buf][warp][0][0]);
+#else
 #pragma unroll
         for (int kk = 0; kk < S::kKStep; kk += 8) {
             half2 a[4], b[4];
@@ -189,24 +198,34 @@ __device__ __forceinline__ void q5_volta_mma_gemm_tile(
                          (S::kKStep + S::kXPad) / 2);
             volta_mma_qk(d, a, b);
         }
+#endif
 
         if (has_next) { commit(carry, buf ^ 1); }
         buf ^= 1;
     }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int row_t = turing_tile_row(l / 4, l % 4);
+        const int col_n = n0 + turing_tile_col(l % 4);
+        const float acc = dt[l / 4][l % 4];
+#else
 #pragma unroll
     for (int l = 0; l < 8; ++l) {
         const int row_t = volta_d_get_i(l);
         const int col_n = n0 + volta_d_get_j(l);
+        const float acc = d[l];
+#endif
         if (row_t < tcnt && col_n < n) {
             if constexpr (kDirect) {
                 const std::int64_t o =
                     static_cast<std::int64_t>(t0 + row_t) * out_ld + col_n;
-                float v = d[l];
+                float v = acc;
                 if constexpr (kAddResidual) { v += __bfloat162float(out[o]); }
                 out[o] = __float2bfloat16(v);
             } else {
-                atomicAdd(&partial[static_cast<std::int64_t>(t0 + row_t) * n + col_n], d[l]);
+                atomicAdd(&partial[static_cast<std::int64_t>(t0 + row_t) * n + col_n], acc);
             }
         }
     }

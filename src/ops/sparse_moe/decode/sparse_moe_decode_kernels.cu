@@ -552,8 +552,11 @@ void launch_d4_dependent_codec(const SparseMoeWeights& weights, Tensor& destinat
     const auto* shared_codes  = static_cast<const std::uint8_t*>(weights.shared_down.qdata);
     const auto* shared_scales = static_cast<const std::uint8_t*>(weights.shared_down.scales);
     auto* output              = static_cast<__nv_bfloat16*>(destination.data);
-    CUDA_CHECK(pdl::launch_dependent({dim3(kHidden), dim3(9 * 32), 0, stream},
-                                     sparse_moe_d4_nine_warp_kernel<Codec, 1>, ids, alpha,
+    // Eight output rows per block: a single 512-wide row is too little work per warp to cover
+    // memory latency (measured 61 -> 40 us per layer on an RTX 2060 SUPER, 16 rows 46 us).
+    constexpr int kD4Rows = 8;
+    CUDA_CHECK(pdl::launch_dependent({dim3(kHidden / kD4Rows), dim3(9 * 32), 0, stream},
+                                     sparse_moe_d4_nine_warp_kernel<Codec, kD4Rows>, ids, alpha,
                                      shared_scale, act, routed_codes, routed_high, routed_scales,
                                      shared_codes, shared_scales, output, addend));
 }

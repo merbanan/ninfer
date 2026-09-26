@@ -404,6 +404,19 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--extended-lambda;--expt-relaxed-constexpr;-diag-suppress=940>)
   target_link_libraries(ninfer_flash_attention_non_rdc PRIVATE ninfer_core CUDA::cudart)
   target_link_libraries(ninfer_ops PRIVATE ninfer_flash_attention_non_rdc)
+
+  # The grouped routed-expert GEMMs of the prefill SparseMoe route share the Q4/Q5 tile bodies,
+  # which have a Volta (mma.m8n8k4) and a Turing (mma.m16n8k8) form; same arrangement as above.
+  add_library(ninfer_sparse_moe_mma_non_rdc STATIC ops/sparse_moe/prefill/sparse_moe_prefill_mma.cu)
+  ninfer_internal_includes(ninfer_sparse_moe_mma_non_rdc)
+  set_target_properties(ninfer_sparse_moe_mma_non_rdc PROPERTIES
+    CUDA_ARCHITECTURES "70;75"
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+  target_compile_options(ninfer_sparse_moe_mma_non_rdc PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
+  target_link_libraries(ninfer_sparse_moe_mma_non_rdc PRIVATE ninfer_core CUDA::cudart)
+  target_link_libraries(ninfer_ops PRIVATE ninfer_sparse_moe_mma_non_rdc)
 endif()
 
 # Product-independent text and media mechanisms.
