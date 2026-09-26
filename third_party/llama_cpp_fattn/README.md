@@ -5,8 +5,12 @@ Vendored from [llama.cpp](https://github.com/ggml-org/llama.cpp), MIT licensed
 `src/ops/common/volta_mma.cuh`, which was transcribed from this project's
 `ggml-cuda/mma.cuh`.
 
-Used by the sm_70 prefill flash-attention route. The top-level README describes the public V100
-performance envelope.
+Used by the sm_70 build's prefill flash-attention route. That translation unit is compiled for
+sm_70 and sm_75 (its own non-RDC archive, see `src/CMakeLists.txt`): a V100 runs the kernel's
+Volta (`mma.m8n8k4`) body and a Turing card its native `mma.m16n8k8` + `ldmatrix` body, with
+host-side configuration following the same split through `ggml_cuda_highest_compiled_arch`.
+Upstream compiles no Turing tile wider than 32 columns, which is the tile both bodies run here.
+The top-level README describes the public V100 performance envelope.
 
 ## Contents
 

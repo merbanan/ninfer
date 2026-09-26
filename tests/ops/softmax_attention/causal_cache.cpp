@@ -2285,6 +2285,17 @@ int run_geometry(const Geometry& geometry) {
             failures += run_a3_case(geometry, storage, test_case, MappingPattern::Identity);
         }
 
+        // Prompt widths the sm_70 build serves with the flash route (Volta body on 7.0, Turing
+        // body on 7.5): a fresh 300-token prompt, and 1,100 tokens after a 700-token prefix,
+        // which crosses the 1,024-token Q block and several 256-key tiles.
+        const AttentionCase flash_cases[] = {
+            {300, 0, 300, 311u},
+            {1100, 700, 1800, 312u},
+        };
+        for (const AttentionCase& test_case : flash_cases) {
+            failures += run_a1_case(geometry, storage, test_case, MappingPattern::Fragmented);
+        }
+
         if (geometry.q_heads == 16) {
             // Loose execution envelopes straddle the two registered host-resource frontiers.
             // Device positions, not these bounds, continue to define the oracle result.

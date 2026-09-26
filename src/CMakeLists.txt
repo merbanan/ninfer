@@ -68,6 +68,7 @@ target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
+  ops/device_code.cu
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
@@ -346,14 +347,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear_swiglu/fp8/fp8_linear_swiglu_cutlass_sm70.cu
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_volta_qpn.cu
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cu
-    ops/linear_swiglu/q4/q4_linear_swiglu_cutlass_sm70.cu
-    ops/launcher/gqa_attention_volta_flash.cu)
-  set_source_files_properties(
-    ops/launcher/gqa_attention_volta_flash.cu
-    TARGET_DIRECTORY ninfer_ops
-    PROPERTIES
-      INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
-      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
+    ops/linear_swiglu/q4/q4_linear_swiglu_cutlass_sm70.cu)
   # --- DFlash2 port: these sm_80-only translation units (cp.async / bf16 mma /
   #     __reduce_*_sync) have no Volta kernel yet. Exclude them from the sm_70 build;
   #     the op wrappers throw std::logic_error under NINFER_VOLTA_BUILD until P2+.
@@ -391,6 +385,26 @@ endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
+
+# The prefill flash-attention route drives the vendored llama.cpp MMA kernel, which has a Volta
+# (m8n8k4) and a Turing (m16n8k8 + ldmatrix) body selected by __CUDA_ARCH__. Building it for sm_75
+# as well lets Turing cards run their native body; the sm_75 code lives in its own non-RDC archive
+# (the translation unit is self-contained behind host launchers) so it never enters the sm_70
+# device link of ninfer_ops.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  add_library(ninfer_flash_attention_non_rdc STATIC ops/launcher/gqa_attention_volta_flash.cu)
+  ninfer_internal_includes(ninfer_flash_attention_non_rdc)
+  target_include_directories(ninfer_flash_attention_non_rdc PRIVATE
+    ${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn)
+  set_target_properties(ninfer_flash_attention_non_rdc PROPERTIES
+    CUDA_ARCHITECTURES "70;75"
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+  target_compile_options(ninfer_flash_attention_non_rdc PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--extended-lambda;--expt-relaxed-constexpr;-diag-suppress=940>)
+  target_link_libraries(ninfer_flash_attention_non_rdc PRIVATE ninfer_core CUDA::cudart)
+  target_link_libraries(ninfer_ops PRIVATE ninfer_flash_attention_non_rdc)
+endif()
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC

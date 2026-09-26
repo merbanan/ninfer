@@ -1,3 +1,4 @@
+#include "ninfer/ops/device_code.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -591,6 +592,7 @@ create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
+    ops::load_device_code();
     auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device,
                                                                startup_observer);
     plan.impl_.reset();

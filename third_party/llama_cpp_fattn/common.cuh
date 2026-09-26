@@ -93,19 +93,18 @@ enum ggml_type {
 #define FLASH_ATTN_AVAILABLE
 
 // AMD_MFMA_AVAILABLE / AMD_WMMA_AVAILABLE / BLACKWELL_MMA_AVAILABLE are
-// deliberately never defined: this vendoring targets NVIDIA sm_70 only.
+// deliberately never defined: this vendoring targets NVIDIA sm_70 and sm_75 only.
 
 // ---------------------------------------------------------------------------
 // Host-side capability predicates
 // ---------------------------------------------------------------------------
 
-// ninfer: upstream resolves this against __CUDA_ARCH_LIST__. This vendoring is
-// compiled for exactly one architecture, so the identity is correct here.
-// This vendored copy is compiled only for sm_70, so every device of compute capability 7.x runs the
-// Volta device code; host-side configuration must match it (a Turing device would otherwise select
-// Turing MMA tiles for Volta kernels and fault).
+// ninfer: upstream resolves this against __CUDA_ARCH_LIST__. This vendoring is compiled for
+// exactly sm_70 and sm_75 (see src/CMakeLists.txt), so a 7.x device runs the Volta body below 7.5
+// and the Turing body from 7.5; host-side configuration must name the same one.
 static int ggml_cuda_highest_compiled_arch(const int arch) {
-    return arch >= GGML_CUDA_CC_VOLTA && arch < GGML_CUDA_CC_AMPERE ? GGML_CUDA_CC_VOLTA : arch;
+    if (arch >= GGML_CUDA_CC_TURING && arch < GGML_CUDA_CC_AMPERE) { return GGML_CUDA_CC_TURING; }
+    return arch >= GGML_CUDA_CC_VOLTA && arch < GGML_CUDA_CC_TURING ? GGML_CUDA_CC_VOLTA : arch;
 }
 
 static bool volta_mma_available(const int cc) {

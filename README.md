@@ -102,8 +102,8 @@ mean output tokens per round over ten measured rounds after two warmups.
 With the sm_70 build, `--offload-experts` keeps the 35B-A3B routed experts in host RAM behind a
 device expert cache and computes cache misses on the CPU or uploads them, whichever is cheaper, so
 the model runs on 8 GB Volta/Turing cards. On an RTX 2060 SUPER with a Ryzen 9 3900X it decodes at
-53-63 tok/s on short prompts and prefills an 18K-token agent prompt at 984 tok/s (llama.cpp on the
-same machine: 31.8 and 761). Convert the published artifact once, then:
+53-63 tok/s on short prompts and prefills an 18K-token agent prompt at 1,050 tok/s (llama.cpp on
+the same machine: 31.8 and 761). Convert the published artifact once, then:
 
 ```bash
 python3 -m tools.convert.qwen3_6_35b_a3b.from_published_v3 \
