@@ -101,8 +101,11 @@ enum ggml_type {
 
 // ninfer: upstream resolves this against __CUDA_ARCH_LIST__. This vendoring is
 // compiled for exactly one architecture, so the identity is correct here.
+// This vendored copy is compiled only for sm_70, so every device of compute capability 7.x runs the
+// Volta device code; host-side configuration must match it (a Turing device would otherwise select
+// Turing MMA tiles for Volta kernels and fault).
 static int ggml_cuda_highest_compiled_arch(const int arch) {
-    return arch;
+    return arch >= GGML_CUDA_CC_VOLTA && arch < GGML_CUDA_CC_AMPERE ? GGML_CUDA_CC_VOLTA : arch;
 }
 
 static bool volta_mma_available(const int cc) {

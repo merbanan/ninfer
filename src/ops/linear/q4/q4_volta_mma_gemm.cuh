@@ -68,20 +68,22 @@ struct Q4VoltaMmaSchedule {
 // frequent shape (gate/up, n=34816) actually runs. With a single split each CTA owns its output
 // tile outright, so the whole fp32 apparatus -- workspace, zeroing memset, atomicAdd, narrowing
 // pass -- is pure overhead against a plain BF16 store. Same structure the W8 kernel is built on.
+// Kernel body over an explicit (row block, split, token tile) = (bx, by, bz), shared by the
+// dense Linear kernel below and the grouped sparse-MoE prefill kernels.
 template <bool kDirect>
-__global__ __launch_bounds__(Q4VoltaMmaSchedule::kThreads, 8) void q4_volta_mma_gemm_kernel(
+__device__ __forceinline__ void q4_volta_mma_gemm_tile(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ x, float* __restrict__ partial,
     __nv_bfloat16* __restrict__ out, int out_ld, int n, int k, int t, int padded_groups,
-    int splits) {
+    int splits, int bx, int by, int bz) {
     using S = Q4VoltaMmaSchedule;
     constexpr int kGroupK = Q4RowSplitStorage::kGroupK;
     constexpr int kCodeB  = Q4RowSplitStorage::kCodeBytesPerGroup;
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int n0   = (static_cast<int>(blockIdx.x) * S::kWarps + warp) * 8;
-    const int t0   = static_cast<int>(blockIdx.z) * S::kTTile;
+    const int n0   = (bx * S::kWarps + warp) * 8;
+    const int t0   = bz * S::kTTile;
     const int tcnt = min(S::kTTile, t - t0);
 
     __shared__ __align__(16) __half x_sh[2][S::kTTile][S::kKStep + S::kXPad];
@@ -89,8 +91,8 @@ __global__ __launch_bounds__(Q4VoltaMmaSchedule::kThreads, 8) void q4_volta_mma_
 
     // Each split owns a kKStep-aligned run of K; the last one absorbs the remainder.
     const int chunk  = (k / splits) & ~(S::kKStep - 1);
-    const int kstart = static_cast<int>(blockIdx.y) * chunk;
-    const int kend   = (static_cast<int>(blockIdx.y) == splits - 1) ? k : kstart + chunk;
+    const int kstart = by * chunk;
+    const int kend   = (by == splits - 1) ? k : kstart + chunk;
     if (kstart >= kend) { return; }
 
     // The pipeline is split into a global-load half and a decode-and-store half, held apart by
@@ -215,7 +217,17 @@ __global__ __launch_bounds__(Q4VoltaMmaSchedule::kThreads, 8) void q4_volta_mma_
     }
 }
 
-__global__ void q4_volta_mma_narrow_kernel(const float* __restrict__ partial,
+template <bool kDirect>
+__global__ __launch_bounds__(Q4VoltaMmaSchedule::kThreads, 8) void q4_volta_mma_gemm_kernel(
+    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ x, float* __restrict__ partial,
+    __nv_bfloat16* __restrict__ out, int out_ld, int n, int k, int t, int padded_groups,
+    int splits) {
+    q4_volta_mma_gemm_tile<kDirect>(codes, scales, x, partial, out, out_ld, n, k, t, padded_groups, splits,
+        static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y), static_cast<int>(blockIdx.z));
+}
+
+static __global__ void q4_volta_mma_narrow_kernel(const float* __restrict__ partial,
                                            __nv_bfloat16* __restrict__ out, std::int64_t count) {
     const std::int64_t i =
         static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;

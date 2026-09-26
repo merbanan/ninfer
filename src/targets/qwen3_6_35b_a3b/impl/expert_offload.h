@@ -72,6 +72,7 @@ struct ExpertOffloadStats {
     std::uint64_t bytes_copied  = 0;
     double upload_seconds       = 0.0; // host time staging uploads on the critical path
     double host_compute_seconds = 0.0;
+    double prefill_moe_seconds  = 0.0; // NINFER_OFFLOAD_TIMING only
 };
 
 // Routed experts of the 35B-A3B Text layers held in host memory (the artifact file mapping, so

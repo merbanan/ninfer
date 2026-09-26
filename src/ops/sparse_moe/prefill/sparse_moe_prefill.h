@@ -55,6 +55,8 @@ struct SparseMoePrefillWorkspace {
     Tensor route_job_count;
     // Offloaded experts only: expert id -> bank holding its rows.
     Tensor bank_of_expert;
+    // Volta tensor-core route: routed gate/up outputs [assignments, 1024] before SwiGLU.
+    Tensor routed_gate_up;
 
     // The three large allocations are lifetime unions:
     //   router scores FP32 <-> shared SwiGLU BF16
@@ -96,6 +98,9 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     out.route_job_columns             = arena.alloc(DType::I32, {max_route_jobs}, 256);
     out.route_job_count               = arena.alloc(DType::I32, {1}, 256);
     out.bank_of_expert                = arena.alloc(DType::I32, {256}, 256);
+#ifdef NINFER_VOLTA_BUILD
+    out.routed_gate_up = arena.alloc(DType::BF16, {1024, assignments}, 256);
+#endif
 
     out.score_storage = arena.alloc(DType::FP32, {kSparseMoeRouterScoreRows, capacity_tokens}, 256);
     out.shared_activation = Tensor(out.score_storage.data, DType::BF16, {512, capacity_tokens});

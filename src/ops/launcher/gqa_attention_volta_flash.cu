@@ -369,8 +369,9 @@ const FlashLaunchConfig& flash_launch_config() {
             :          shared_Q + shared_KV + shared_mask);
 
         auto kernel = flash_attn_ext_f16<kDKQ, kDV, P::kNcols1, P::kNcols2, false, false>;
-        cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel),
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, c.nbytes_shared);
+        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel),
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(c.nbytes_shared)));
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &c.blocks_per_sm, reinterpret_cast<const void *>(kernel), c.nthreads, c.nbytes_shared);
         if (c.blocks_per_sm <= 0) { c.blocks_per_sm = 1; }
@@ -429,6 +430,7 @@ void launch_flash_block(const float* q_f32, const half* k_f16, const half* v_f16
             nb11, nb12, 0,
             tokens, 1, 1,
             nb31, 0, 0);
+    CUDA_CHECK(cudaGetLastError());
 
     if (nblocks % ntiles_dst == 0 && nblocks > ntiles_dst) {
         const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * kKVHeads);

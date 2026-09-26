@@ -59,13 +59,15 @@ struct Q5VoltaMmaSchedule {
 // workspace, its memset, the atomics and the narrowing pass are all pure overhead against a plain
 // BF16 store. `kAddResidual` folds linear_add's beta=1 epilogue into that store, reading `out` as
 // C and writing it back as D exactly as the narrowing kernel would have.
+// Kernel body over an explicit (row block, split, token tile) = (bx, by, bz), shared by the
+// dense Linear kernel below and the grouped sparse-MoE prefill kernels.
 template <bool kDirect, bool kAddResidual>
-__global__ __launch_bounds__(Q5VoltaMmaSchedule::kThreads, 8) void q5_volta_mma_gemm_kernel(
+__device__ __forceinline__ void q5_volta_mma_gemm_tile(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ high,
     const std::uint8_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ x, float* __restrict__ partial,
     __nv_bfloat16* __restrict__ out, int out_ld, int n, int k, int t, int padded_groups,
-    int splits) {
+    int splits, int bx, int by, int bz) {
     using S = Q5VoltaMmaSchedule;
     constexpr int kGroupK = Q5RowSplitStorage::kGroupK;
     constexpr int kCodeB  = Q5RowSplitStorage::kCodeBytesPerGroup;
@@ -73,8 +75,8 @@ __global__ __launch_bounds__(Q5VoltaMmaSchedule::kThreads, 8) void q5_volta_mma_
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int n0   = (static_cast<int>(blockIdx.x) * S::kWarps + warp) * 8;
-    const int t0   = static_cast<int>(blockIdx.z) * S::kTTile;
+    const int n0   = (bx * S::kWarps + warp) * 8;
+    const int t0   = bz * S::kTTile;
     const int tcnt = min(S::kTTile, t - t0);
 
     __shared__ __align__(16) __half x_sh[2][S::kTTile][S::kKStep + S::kXPad];
@@ -82,8 +84,8 @@ __global__ __launch_bounds__(Q5VoltaMmaSchedule::kThreads, 8) void q5_volta_mma_
 
     // Each split owns a kKStep-aligned run of K; the last one absorbs the remainder.
     const int chunk  = (k / splits) & ~(S::kKStep - 1);
-    const int kstart = static_cast<int>(blockIdx.y) * chunk;
-    const int kend   = (static_cast<int>(blockIdx.y) == splits - 1) ? k : kstart + chunk;
+    const int kstart = by * chunk;
+    const int kend   = (by == splits - 1) ? k : kstart + chunk;
     if (kstart >= kend) { return; }
 
     // Split into a global-load half and a decode-and-store half held apart by a register carrier,
@@ -210,10 +212,21 @@ __global__ __launch_bounds__(Q5VoltaMmaSchedule::kThreads, 8) void q5_volta_mma_
     }
 }
 
+template <bool kDirect, bool kAddResidual>
+__global__ __launch_bounds__(Q5VoltaMmaSchedule::kThreads, 8) void q5_volta_mma_gemm_kernel(
+    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ high,
+    const std::uint8_t* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ x, float* __restrict__ partial,
+    __nv_bfloat16* __restrict__ out, int out_ld, int n, int k, int t, int padded_groups,
+    int splits) {
+    q5_volta_mma_gemm_tile<kDirect, kAddResidual>(codes, high, scales, x, partial, out, out_ld, n, k, t, padded_groups, splits,
+        static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y), static_cast<int>(blockIdx.z));
+}
+
 // `out` is the linear_add residual: read as C and written back as D, matching the beta=1
 // epilogue the CUTLASS route uses. With kAddResidual false this is a plain narrowing store.
 template <bool kAddResidual>
-__global__ void q5_volta_mma_narrow_kernel(const float* __restrict__ partial,
+static __global__ void q5_volta_mma_narrow_kernel(const float* __restrict__ partial,
                                            __nv_bfloat16* __restrict__ out, int n, int t,
                                            int out_ld) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;

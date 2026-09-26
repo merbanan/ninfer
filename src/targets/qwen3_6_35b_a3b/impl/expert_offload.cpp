@@ -253,6 +253,10 @@ ExpertOffload::~ExpertOffload() {
                      static_cast<unsigned long long>(stats_.prefetched),
                      static_cast<double>(stats_.bytes_copied) / static_cast<double>(1ULL << 30),
                      stats_.upload_seconds, stats_.host_compute_seconds);
+        if (stats_.prefill_moe_seconds > 0) {
+            std::fprintf(stderr, "[qwen3.6-35b-a3b expert offload] prefill MoE wall time %.2f s\n",
+                         stats_.prefill_moe_seconds);
+        }
     }
 }
 
@@ -734,6 +738,25 @@ void ExpertOffload::sparse_moe(std::size_t layer, const Tensor& x, const ops::Sp
         };
     }
     ++stats_.calls;
+    // NINFER_OFFLOAD_TIMING: synchronize around prefill-size calls to attribute their wall time.
+    static const bool timing = std::getenv("NINFER_OFFLOAD_TIMING") != nullptr;
+    const bool timed         = timing && x.ne[1] >= 256;
+    std::chrono::steady_clock::time_point timed_start;
+    if (timed) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        timed_start = std::chrono::steady_clock::now();
+    }
+    struct TimedScope {
+        bool active;
+        cudaStream_t stream;
+        std::chrono::steady_clock::time_point start;
+        double& total;
+        ~TimedScope() {
+            if (!active) { return; }
+            (void)cudaStreamSynchronize(stream);
+            total += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        }
+    } timed_scope{timed, stream, timed_start, stats_.prefill_moe_seconds};
     auto scope               = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
         weights.routed_gate_up.qtype, weights.routed_down.qtype, x.ne[1], x.ne[1]));

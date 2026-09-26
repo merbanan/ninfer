@@ -1,3 +1,7 @@
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/q4/q4_volta_mma_gemm.cuh"
+#include "ops/linear/q5/q5_volta_mma_gemm.cuh"
+#endif
 #include "ops/sparse_moe/sparse_moe_residency.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
@@ -15,6 +19,7 @@
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include <cuda_bf16.h>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -1700,6 +1705,93 @@ __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict
 
 } // namespace
 
+#ifdef NINFER_VOLTA_BUILD
+// Grouped tensor-core routed projections for Volta prefill. Every CTA is one 32-row block of one
+// 32-column tile of one route job (an expert's packed column range from the scan), and runs the
+// dense Linear tile body with pointers moved to that expert's bank rows and packed columns.
+constexpr int kMmaTile = 32;
+
+__device__ __forceinline__ bool moe_mma_job(const int* __restrict__ expert_offsets,
+                                            const int* __restrict__ route_job_experts,
+                                            const int* __restrict__ route_job_columns,
+                                            const int* __restrict__ route_job_count,
+                                            const int* __restrict__ bank_of_expert, int tiles_per_job,
+                                            int& bank, int& begin, int& count, int& tile) {
+    const int job = static_cast<int>(blockIdx.z) / tiles_per_job;
+    if (job >= *route_job_count) { return false; }
+    const int expert = route_job_experts[job];
+    begin            = expert_offsets[expert];
+    count            = expert_offsets[expert + 1] - begin;
+    const int column = route_job_columns[job] + (static_cast<int>(blockIdx.z) % tiles_per_job) * kMmaTile;
+    if (column >= count) { return false; }
+    tile = column / kMmaTile;
+    bank = bank_of_expert != nullptr ? bank_of_expert[expert] : expert;
+    return true;
+}
+
+__global__ __launch_bounds__(Q4VoltaMmaSchedule::kThreads, 8) void sparse_moe_prefill_q4_gate_up_mma_kernel(
+    const __nv_bfloat16* __restrict__ gathered, const int* __restrict__ expert_offsets,
+    const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
+    const int* __restrict__ route_job_count, const int* __restrict__ bank_of_expert, int tiles_per_job,
+    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ gate_up) {
+    int bank = 0, begin = 0, count = 0, tile = 0;
+    if (!moe_mma_job(expert_offsets, route_job_experts, route_job_columns, route_job_count, bank_of_expert,
+                     tiles_per_job, bank, begin, count, tile)) {
+        return;
+    }
+    constexpr int kRows   = 2 * kIntermediate;
+    constexpr int kGroups = kHidden / Q4RowSplitStorage::kGroupK;
+    const std::int64_t row0 = static_cast<std::int64_t>(bank) * kRows * kGroups;
+    q4_volta_mma_gemm_tile<true>(codes + row0 * Q4RowSplitStorage::kCodeBytesPerGroup,
+                                 scales + row0 * Q4RowSplitStorage::kScaleBytesPerGroup,
+                                 gathered + static_cast<std::int64_t>(begin) * kHidden, nullptr,
+                                 gate_up + static_cast<std::int64_t>(begin) * kRows, kRows, kRows, kHidden,
+                                 count, kGroups, 1, static_cast<int>(blockIdx.x), 0, tile);
+}
+
+__global__ __launch_bounds__(Q5VoltaMmaSchedule::kThreads, 8) void sparse_moe_prefill_q5_down_mma_kernel(
+    const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
+    const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
+    const int* __restrict__ route_job_count, const int* __restrict__ bank_of_expert, int tiles_per_job,
+    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ high,
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ output) {
+    int bank = 0, begin = 0, count = 0, tile = 0;
+    if (!moe_mma_job(expert_offsets, route_job_experts, route_job_columns, route_job_count, bank_of_expert,
+                     tiles_per_job, bank, begin, count, tile)) {
+        return;
+    }
+    constexpr int kGroups   = kIntermediate / Q5RowSplitStorage::kGroupK;
+    const std::int64_t row0 = static_cast<std::int64_t>(bank) * kHidden * kGroups;
+    q5_volta_mma_gemm_tile<true, false>(codes + row0 * Q5RowSplitStorage::kCodeBytesPerGroup,
+                                        high + row0 * Q5RowSplitStorage::kHighBytesPerGroup,
+                                        scales + row0 * Q5RowSplitStorage::kScaleBytesPerGroup,
+                                        activation + static_cast<std::int64_t>(begin) * kIntermediate, nullptr,
+                                        output + static_cast<std::int64_t>(begin) * kHidden, kHidden, kHidden,
+                                        kIntermediate, count, kGroups, 1, static_cast<int>(blockIdx.x), 0, tile);
+}
+
+// activation[slot][r] = silu(gate_up[slot][r]) * gate_up[slot][512 + r], BF16 in and out.
+__global__ void sparse_moe_prefill_swiglu_kernel(const __nv_bfloat16* __restrict__ gate_up,
+                                                 __nv_bfloat16* __restrict__ activation, int assignments) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<std::int64_t>(assignments) * kIntermediate) { return; }
+    const std::int64_t slot = i / kIntermediate;
+    const int row           = static_cast<int>(i - slot * kIntermediate);
+    const float g = __bfloat162float(gate_up[slot * 2 * kIntermediate + row]);
+    const float u = __bfloat162float(gate_up[slot * 2 * kIntermediate + kIntermediate + row]);
+    activation[i] = __float2bfloat16(g / (1.0f + __expf(-g)) * u);
+}
+
+bool prefill_mma_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_MOE_PREFILL_MMA");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+#endif // NINFER_VOLTA_BUILD
+
 void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
                                const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
@@ -1845,9 +1937,26 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
 #ifdef NINFER_VOLTA_BUILD
-        // The grouped SIMT kernels take the same device-side job list and the same
+        // The grouped kernels take the same device-side job list and the same
         // BN as the scan was told to use, so the column tiling matches exactly.
-        if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
+        const int max_route_jobs = assignments / 32 + 256;
+        const int tiles_per_job  = route_job_bn / kMmaTile;
+        const bool mma           = prefill_mma_enabled() && weights.routed_gate_up.qtype == QType::Q4G64_F16S;
+        if (mma) {
+            auto* gate_up_out = static_cast<__nv_bfloat16*>(workspace.routed_gate_up.data);
+            sparse_moe_prefill_q4_gate_up_mma_kernel<<<dim3(2 * kIntermediate / Q4VoltaMmaSchedule::kRowsPerCta, 1,
+                                                            max_route_jobs * tiles_per_job),
+                                                       Q4VoltaMmaSchedule::kThreads, 0, stream>>>(
+                grouped_io, offsets, route_job_experts, route_job_columns, route_job_count, bank_of_expert,
+                tiles_per_job, routed_gate_codes, routed_gate_scales, gate_up_out);
+            CUDA_CHECK(cudaGetLastError());
+            // The adaptive route owns this storage for its FP32 reduction; its grouped jobs are empty.
+            if (!adaptive) {
+                const std::int64_t elements = static_cast<std::int64_t>(assignments) * kIntermediate;
+                sparse_moe_prefill_swiglu_kernel<<<static_cast<unsigned>((elements + 255) / 256), 256, 0,
+                                                   stream>>>(gate_up_out, routed_activation, assignments);
+            }
+        } else if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_simt_kernel<64>
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
@@ -1925,7 +2034,14 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 #ifdef NINFER_VOLTA_BUILD
         switch (weights.routed_down.qtype) {
         case QType::Q5G64_F16S:
-            if (wide_plan) {
+            if (mma) {
+                sparse_moe_prefill_q5_down_mma_kernel<<<dim3(kHidden / Q5VoltaMmaSchedule::kRowsPerCta, 1,
+                                                             max_route_jobs * tiles_per_job),
+                                                        Q5VoltaMmaSchedule::kThreads, 0, stream>>>(
+                    routed_activation, offsets, route_job_experts, route_job_columns, route_job_count,
+                    bank_of_expert, tiles_per_job, routed_down_codes, routed_down_high, routed_down_scales,
+                    grouped_io);
+            } else if (wide_plan) {
                 sparse_moe_prefill_qx_down_simt_kernel<SimtQ5Decode, 64>
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
