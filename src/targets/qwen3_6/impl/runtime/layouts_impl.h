@@ -719,8 +719,9 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         break;
     }
 #ifdef NINFER_VOLTA_BUILD
-    if (options.kv_cache == KvCacheStorage::Nvfp4Group16 ||
-        options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value) {
+    // K8V4 runs on the Volta tensor-core small-T kernel and the flash prompt route, which decode
+    // its FP8 K and NVFP4 V to FP16; symmetric NVFP4 has no Volta route.
+    if (options.kv_cache == KvCacheStorage::Nvfp4Group16) {
         throw std::invalid_argument("NVFP4 KV-cache storage is unavailable on Volta");
     }
     // The sm_70 image also runs on Turing (7.5): its cubins are binary-compatible within major 7.

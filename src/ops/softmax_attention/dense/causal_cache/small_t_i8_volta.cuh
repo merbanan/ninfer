@@ -67,6 +67,9 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
+#include "ops/kv_cache/append/k8v4_kernel.cuh"
+#include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
+#include "ops/kv_cache/nvfp4_group16_codec.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -89,8 +92,12 @@ __device__ __forceinline__ int4 causal_kv_dequant_i8x8_f16_from(
     return *reinterpret_cast<const int4*>(packed);
 }
 
+// K8v4 selects the asymmetric FP8-E4M3-row256 K / NVFP4-G16 V cache instead of INT8-G64: the
+// cache pointers then carry FP8 K codes, NVFP4 V codes, one FP16 scale per K row and one E4M3
+// scale byte per 16 V elements. Both K and V are stored in the normalized-Hadamard basis; Q is
+// rotated here as for INT8, and the k8v4 reduce rotates the merged output back.
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput>
+          typename CacheInput, bool K8v4 = false>
 __launch_bounds__(WarpsPerCta * 32, 2) __global__
     void causal_attention_small_t_tc_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
@@ -218,8 +225,10 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     }
 
     const int window = last_pos + 1;
+    // The split rule is the one the codec's reduce merges with.
     const int active_split_count =
-        causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
+        K8v4 ? causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile)
+             : causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
 
     const int logical_tiles = div_up(window, Bc);
@@ -237,11 +246,33 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
-    for (int page = tid; page < page_count; page += Threads) {
+    // Splits longer than PageIds pages (quantized split plans can allot 64K keys to few splits)
+    // read the remaining page ids straight from the block table.
+    for (int page = tid; page < page_count && page < PageIds; page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
     }
 
-    if constexpr (CacheInput::writes_cache) {
+    if constexpr (CacheInput::writes_cache && K8v4) {
+        // One warp owns a D256 row: the shared k8v4 row encoder rotates K and V and emits the
+        // FP8 row and the sixteen NVFP4 groups.
+        __shared__ float append_scratch[WarpsPerCta][kCausalHeadDim];
+        for (int token = warp; token < valid_tokens; token += WarpsPerCta) {
+            const int position = pos[token];
+            if (position < split_start || position >= split_end || position < 0 ||
+                position >= logical_capacity) {
+                continue;
+            }
+            int physical_page = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+            physical_page     = __shfl_sync(FullMask, physical_page, 0);
+            kv_cache_append_full_k8v4_row<Geometry>(
+                input.k, input.v, reinterpret_cast<std::uint8_t*>(cache_k_i8),
+                reinterpret_cast<std::uint8_t*>(cache_v_i8), cache_k_scale,
+                reinterpret_cast<std::uint8_t*>(cache_v_scale), token, kv_head, physical_page,
+                position & kPagedKVPageMask, lane, append_scratch[warp]);
+            __syncwarp();
+        }
+        __syncthreads();
+    } else if constexpr (CacheInput::writes_cache) {
         // One warp owns a D256 row, applies the registered normalized transform to K, and then
         // emits all four G64 groups. V remains in its native coordinates.
         for (int token = warp; token < valid_tokens; token += WarpsPerCta) {
@@ -383,7 +414,9 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         for (int kb = 0; kb < key_blocks; ++kb) {
             const int k0 = first_tile + kb * Bc;
             if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
-                physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+                const int page_index = (k0 >> kPagedKVPageShift) - first_page;
+                physical_page        = page_index < PageIds ? physical_pages_s[page_index]
+                                                            : block_table[first_page + page_index];
             }
 
             // Stage K/V for this key tile, dequantizing int8 -> fp16 on the way in. Unlike the
@@ -398,7 +431,30 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                 const int key   = k0 + key_l;
                 half* k_dst     = &k_s[key_l * SmemStride + d];
                 half* v_dst     = &v_s[key_l * SmemStride + d];
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < split_end && K8v4) {
+                    const int page_offset = key & kPagedKVPageMask;
+                    const auto* k_codes   = reinterpret_cast<const std::uint8_t*>(cache_k_i8);
+                    const auto* v_codes   = reinterpret_cast<const std::uint8_t*>(cache_v_i8);
+                    const auto* v_scales  = reinterpret_cast<const std::uint8_t*>(cache_v_scale);
+                    const __half ks = cache_k_scale[kv_cache_fp8_scale_index<Geometry>(
+                        physical_page, kv_head, page_offset)];
+                    const uint2 k8 = load_vec<uint2>(&k_codes[kv_cache_fp8_code_index<Geometry>(
+                        physical_page, kv_head, d, page_offset)]);
+                    __half2 kh[4];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const std::uint32_t word = i < 2 ? k8.x : k8.y;
+                        kh[i] = kv_cache_fp8_dequant_code2_to_half2(
+                            static_cast<std::uint16_t>(word >> (16 * (i & 1))), ks);
+                    }
+                    store_vec(k_dst, *reinterpret_cast<const int4*>(kh));
+                    store_vec(v_dst, kv_cache_nvfp4_dequant_f16x8(
+                                         &v_codes[kv_cache_nvfp4_code_index<Geometry>(
+                                             physical_page, kv_head, d, page_offset)],
+                                         v_scales[kv_cache_nvfp4_scale_index<Geometry>(
+                                             physical_page, kv_head, d / kKVCacheNvfp4Group,
+                                             page_offset)]));
+                } else if (key >= split_start && key < split_end) {
                     const int page_offset = key & kPagedKVPageMask;
                     const std::int64_t code_off =
                         kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d, page_offset);

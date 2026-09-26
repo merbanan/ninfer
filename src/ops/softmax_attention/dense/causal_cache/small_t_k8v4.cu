@@ -4,6 +4,9 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_volta.cuh"
+#endif
 
 #include <cstdint>
 #include <stdexcept>
@@ -16,6 +19,27 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
                          PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                          std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                          Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    // sm_70/sm_75 have no FP8 tensor-core MMA: the Volta tensor-core small-T kernel dequantizes
+    // FP8 K and NVFP4 V to FP16 while staging, and the reduce below is unchanged.
+    const dim3 volta_grid(Geometry::KVHeads, splits, invocation.batch_size);
+    causal_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, 4, MultiBatch, Masked, CacheInput,
+                                                        true>
+        <<<volta_grid, 4 * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input, static_cast<const std::int32_t*>(positions.data),
+            static_cast<std::int8_t*>(cache.k_pages.data), static_cast<std::int8_t*>(cache.v_pages.data),
+            static_cast<__half*>(cache.k_scale_pages.data), static_cast<__half*>(cache.v_scale_pages.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr ? nullptr
+                                                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr ? nullptr
+                                             : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
+            logical_capacity, scale, static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
+            static_cast<float*>(partial_l.data));
+    CUDA_CHECK(cudaGetLastError());
+    return;
+#endif
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
     constexpr int Warps                = RowTiles == 3 ? 12 : 8;

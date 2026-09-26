@@ -93,6 +93,14 @@ std::int32_t causal_small_t_launch_capacity(CausalAttentionExecutionEnvelope env
     // Evaluating every segment end plus both interval ends gives the exact interval maximum.
     constexpr std::uint32_t ends[] = {128, 160, 512, 4096, 5000, 8198, 16390};
     for (const std::uint32_t end : ends) { include(end); }
+#ifdef NINFER_VOLTA_BUILD
+    // This build raises the split ceiling above 256 for the BF16/INT8 reduces, which fold over
+    // their block; the K8V4 reduce merges at most 256 splits (one per thread).
+    constexpr std::int32_t kK8v4ReduceMaxSplits = 256;
+    if (storage == KvCacheStorage::Fp8KeyNvfp4Value && capacity > kK8v4ReduceMaxSplits) {
+        capacity = kK8v4ReduceMaxSplits;
+    }
+#endif
     return capacity;
 }
 

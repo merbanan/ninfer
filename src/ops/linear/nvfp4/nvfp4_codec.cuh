@@ -33,10 +33,9 @@ static_assert(alignof(Nvfp4QuantizedK16) == 8);
 
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
-// cvt.e2m1x2 is native FP4 hardware, Blackwell-only -- Volta has no FP4 hardware at all,
-// so unlike the mma.cuh helpers this isn't "no SIMT replacement built yet", it's simply
-// never going to have one. Already permanently out of scope (see docs/v100.md);
-// this only needs a guard so ptxas doesn't reject the PTX outright at compile time.
+// cvt.e2m1x2 is native FP4 hardware from sm_80 PTX on; the sm_70 build (Volta, and Turing
+// running it) converts in software with the same round-to-nearest-even, saturating semantics.
+// Each byte holds the first value of its pair in the low nibble, as the PTX operand order does.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("{\n"
                  ".reg .b8 b0;\n"
@@ -64,10 +63,14 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[4].x), "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
 #else
-    (void)values;
-    codes_lo = 0;
-    codes_hi = 0;
-    __trap();
+    std::uint32_t words[2] = {0, 0};
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        const __nv_fp4x2_storage_t byte = __nv_cvt_float2_to_fp4x2(values[pair], __NV_E2M1, cudaRoundNearest);
+        words[pair / 4] |= static_cast<std::uint32_t>(byte) << (8 * (pair % 4));
+    }
+    codes_lo = words[0];
+    codes_hi = words[1];
 #endif
 }
 

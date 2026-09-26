@@ -273,13 +273,20 @@ struct SmallTWorkspace {
 };
 
 #ifdef NINFER_VOLTA_BUILD
+// K8V4 on Volta/Turing has no general prompt kernel (the native one uses FP8 tensor-core MMA):
+// prompts the flash route cannot take run as chunked small-T on the Volta tensor-core kernel.
+constexpr detail::CausalAttentionRoute volta_k8v4_prompt_fallback() {
+    return detail::CausalAttentionRoute::ChunkedSmallT;
+}
+
 bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
                                 std::int32_t batch_size, KvCacheStorage cache_storage) {
     const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
                                     q_heads == CausalD256H16Kv2::QHeads;
     return supported_geometry && batch_size == 1 &&
            (cache_storage == KvCacheStorage::BFloat16 ||
-            cache_storage == KvCacheStorage::Int8Group64) &&
+            cache_storage == KvCacheStorage::Int8Group64 ||
+            cache_storage == KvCacheStorage::Fp8KeyNvfp4Value) &&
            width >= detail::kVoltaFlashMinimumWidth;
 }
 
@@ -471,7 +478,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         return layout.peak_bytes(1);
     };
     const auto exact_capacity = [&](std::int32_t width) {
-        const detail::CausalAttentionRoute route =
+        detail::CausalAttentionRoute route =
             detail::causal_attention_resolve_route(q_heads, width, batch_size, cache_storage,
                                                    envelope);
         if (route == detail::CausalAttentionRoute::Prompt) {
@@ -481,8 +488,11 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
                 (void)allocate_volta_flash_workspace(layout, q_heads, width, envelope);
                 return layout.peak_bytes(1);
             }
-#endif
+            if (cache_storage != KvCacheStorage::Fp8KeyNvfp4Value) { return std::size_t{0}; }
+            route = volta_k8v4_prompt_fallback();
+#else
             return std::size_t{0};
+#endif
         }
 #ifdef NINFER_VOLTA_BUILD
         // Volta FP8 uses the exact direct kernel. INT8 has a native tensor-core small-T route
@@ -545,7 +555,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_contiguous_nonnull(v, op, "v");
 
     auto scope = workspace.scope();
-    const detail::CausalAttentionRoute route =
+    detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
 #ifdef NINFER_VOLTA_BUILD
     if (route == detail::CausalAttentionRoute::Prompt && valid_columns.data == nullptr &&
@@ -557,6 +567,10 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered,
             staging.mask, staging.q_f32, staging.out_f32, staging.dst_meta, out, stream);
         return;
+    }
+    if (route == detail::CausalAttentionRoute::Prompt &&
+        cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        route = volta_k8v4_prompt_fallback();
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows,
@@ -592,9 +606,24 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
 
     auto scope = workspace.scope();
-    const detail::CausalAttentionRoute route =
+    detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, cache.storage, envelope);
 #ifdef NINFER_VOLTA_BUILD
+    // Wide cached prompts take the same flash route as the appending form (nothing to append),
+    // which is also what the shared workspace query plans for.
+    if (route == detail::CausalAttentionRoute::Prompt &&
+        volta_flash_route_possible(q.ne[1], q.ne[2], 1, cache.storage)) {
+        VoltaFlashWorkspace staging = allocate_volta_flash_workspace(workspace, q.ne[1], q.ne[2], envelope);
+        detail::causal_attention_volta_flash_launch(
+            q, Tensor{}, Tensor{}, positions, Tensor{}, scale, single_row_paged_kv_batch_view(cache), envelope,
+            detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered, staging.mask, staging.q_f32,
+            staging.out_f32, staging.dst_meta, out, stream);
+        return;
+    }
+    if (route == detail::CausalAttentionRoute::Prompt &&
+        cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        route = volta_k8v4_prompt_fallback();
+    }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
         return;
