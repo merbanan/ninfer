@@ -268,11 +268,29 @@ struct RoutePattern {
     int tied_excluded = -1;
 };
 
-constexpr std::array<RoutePattern, 3> kRoutePatterns{{
-    {{{255, 0, 17, 31, 63, 127, 191, 223}}, -1},
-    {{{0, 17, 31, 63, 127, 191, 223, 254}}, 255},
-    {{{223, 191, 127, 63, 31, 17, 0, 255}}, -1},
-}};
+// Base patterns: nine experts, the top-8 tie, and id extremes; the offloaded runs use only these.
+constexpr int kBasePatterns = 3;
+// Spread patterns: pattern p selects experts p, p + 32, ..., p + 224, so tokens cycling through
+// them touch every expert with one or two columns each. At T >= 47 that gives far more grouped
+// jobs than 3.5 per token, which makes the device take the adaptive fixed-token route.
+constexpr int kSpreadPatterns = 32;
+
+const std::vector<RoutePattern>& route_patterns() {
+    static const std::vector<RoutePattern> patterns = [] {
+        std::vector<RoutePattern> out{
+            {{{255, 0, 17, 31, 63, 127, 191, 223}}, -1},
+            {{{0, 17, 31, 63, 127, 191, 223, 254}}, 255},
+            {{{223, 191, 127, 63, 31, 17, 0, 255}}, -1},
+        };
+        for (int p = 0; p < kSpreadPatterns; ++p) {
+            RoutePattern route;
+            for (int rank = 0; rank < kTopK; ++rank) { route.selected[rank] = p + 32 * rank; }
+            out.push_back(route);
+        }
+        return out;
+    }();
+    return patterns;
+}
 
 std::vector<float> make_input(int pattern) {
     std::vector<float> input(kHidden);
@@ -280,10 +298,9 @@ std::vector<float> make_input(int pattern) {
     for (int column = 1; column < kHidden; ++column) {
         input[column] = 0.025f + static_cast<float>((column * 7 + pattern * 11) % 19) * 0.002f;
     }
-    for (std::size_t marker = 0; marker < kRoutePatterns.size(); ++marker) {
-        input[kHidden - static_cast<int>(kRoutePatterns.size()) + static_cast<int>(marker)] = 0.0f;
-    }
-    input[kHidden - static_cast<int>(kRoutePatterns.size()) + pattern] = 1.0f;
+    const int patterns = static_cast<int>(route_patterns().size());
+    for (int marker = 0; marker < patterns; ++marker) { input[kHidden - patterns + marker] = 0.0f; }
+    input[kHidden - patterns + pattern] = 1.0f;
     round_to_bf16(input);
     return input;
 }
@@ -309,10 +326,10 @@ std::vector<float> make_router() {
     for (int expert = 0; expert < kExperts; ++expert) {
         router[static_cast<std::size_t>(expert) * kHidden] -= 8.0f;
     }
-    for (std::size_t pattern = 0; pattern < kRoutePatterns.size(); ++pattern) {
+    for (std::size_t pattern = 0; pattern < route_patterns().size(); ++pattern) {
         const int marker =
-            kHidden - static_cast<int>(kRoutePatterns.size()) + static_cast<int>(pattern);
-        const RoutePattern& route = kRoutePatterns[pattern];
+            kHidden - static_cast<int>(route_patterns().size()) + static_cast<int>(pattern);
+        const RoutePattern& route = route_patterns()[pattern];
         for (int rank = 0; rank < kTopK; ++rank) {
             const float score =
                 rank == kTopK - 1 && route.tied_excluded >= 0 ? 2.0f : 4.0f - 0.25f * rank;
@@ -492,20 +509,26 @@ public:
             offload_down_ = std::make_unique<DeviceRowSplit>(profile.routed_down,
                                                              kOffloadBanks * kHidden, kIntermediate);
         }
-        for (int pattern = 0; pattern < static_cast<int>(kRoutePatterns.size()); ++pattern) {
+        for (int pattern = 0; pattern < static_cast<int>(route_patterns().size()); ++pattern) {
             inputs_.push_back(make_input(pattern));
             residuals_.push_back(make_residual(pattern));
         }
 
         std::vector<int> expert_ids;
-        for (const RoutePattern& route : kRoutePatterns) {
-            for (int expert : route.selected) {
+        for (std::size_t pattern = 0; pattern < route_patterns().size(); ++pattern) {
+            for (int expert : route_patterns()[pattern].selected) {
                 if (std::find(expert_ids.begin(), expert_ids.end(), expert) == expert_ids.end()) {
                     expert_ids.push_back(expert);
+                }
+                if (pattern < kBasePatterns &&
+                    std::find(base_expert_ids_.begin(), base_expert_ids_.end(), expert) ==
+                        base_expert_ids_.end()) {
+                    base_expert_ids_.push_back(expert);
                 }
             }
         }
         std::sort(expert_ids.begin(), expert_ids.end());
+        std::sort(base_expert_ids_.begin(), base_expert_ids_.end());
         for (int expert : expert_ids) {
             const float factor = 0.8f + static_cast<float>((expert * 3) % 11) * 0.045f;
             auto gate_up       = quantized_weight::pack_row_split_lowbit(
@@ -528,10 +551,10 @@ public:
         shared_gate_.copy_rows(shared_gate_host_, 0);
         shared_down_device_.copy_rows(shared_down_host_, 0);
 
-        for (int pattern = 0; pattern < static_cast<int>(kRoutePatterns.size()); ++pattern) {
+        for (int pattern = 0; pattern < static_cast<int>(route_patterns().size()); ++pattern) {
             references_.push_back(sparse_moe_oracle(inputs_[pattern], residuals_[pattern], router_,
                                                     experts_, shared_gate_host_, shared_down_host_,
-                                                    kRoutePatterns[pattern]));
+                                                    route_patterns()[pattern]));
         }
     }
 
@@ -539,18 +562,23 @@ public:
     // the residency's acquire, with every expert placed in a slot other than its id.
     // OffloadedCold additionally leaves every other populated expert cold whenever the call admits
     // host-computed experts; the production CPU kernels compute them.
+    // spread: tokens cycle through the spread patterns instead of the base ones (resident only).
     int run(std::int32_t tokens, int first_pattern, bool graph_replay,
-            Residency residency_mode = Residency::Resident) {
+            Residency residency_mode = Residency::Resident, bool spread = false) {
         const bool offloaded = residency_mode != Residency::Resident;
         const bool with_cold = residency_mode == Residency::OffloadedCold;
         const std::string label = std::string(profile_.name) +
                                   (with_cold ? " offloaded+cold" : offloaded ? " offloaded" : "") +
-                                  " T=" + std::to_string(tokens);
+                                  (spread ? " spread" : "") + " T=" + std::to_string(tokens);
+        const auto pattern_of = [&](std::int32_t token) {
+            return spread ? kBasePatterns + (first_pattern + token) % kSpreadPatterns
+                          : (first_pattern + token) % kBasePatterns;
+        };
         std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<float> residual(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<double> reference(static_cast<std::size_t>(kHidden) * tokens);
         for (std::int32_t token = 0; token < tokens; ++token) {
-            const int pattern = (first_pattern + token) % static_cast<int>(kRoutePatterns.size());
+            const int pattern = pattern_of(token);
             std::copy(inputs_[pattern].begin(), inputs_[pattern].end(),
                       input.begin() + static_cast<std::size_t>(token) * kHidden);
             std::copy(residuals_[pattern].begin(), residuals_[pattern].end(),
@@ -583,8 +611,7 @@ public:
 
         std::set<int> expected_experts;
         for (std::int32_t token = 0; token < tokens; ++token) {
-            const RoutePattern& route =
-                kRoutePatterns[(first_pattern + token) % static_cast<int>(kRoutePatterns.size())];
+            const RoutePattern& route = route_patterns()[static_cast<std::size_t>(pattern_of(token))];
             expected_experts.insert(route.selected.begin(), route.selected.end());
         }
         std::set<int> requested_experts;
@@ -769,6 +796,7 @@ private:
     std::vector<std::vector<float>> inputs_;
     std::vector<std::vector<float>> residuals_;
     std::vector<HostExpert> experts_;
+    std::vector<int> base_expert_ids_; // experts of the base patterns, in id order
     quantized_weight::PackedWeight shared_gate_host_;
     quantized_weight::PackedWeight shared_down_host_;
     std::vector<std::vector<double>> references_;
@@ -776,20 +804,16 @@ private:
     std::unique_ptr<DeviceRowSplit> offload_down_;
 
     int offload_index(int expert) const {
-        for (std::size_t i = 0; i < experts_.size(); ++i) {
-            if (experts_[i].id == expert) { return static_cast<int>(i); }
+        for (std::size_t i = 0; i < base_expert_ids_.size(); ++i) {
+            if (base_expert_ids_[i] == expert) { return static_cast<int>(i); }
         }
         return -1;
     }
 
-    // Populated expert i (in id order) lives in slot (5i + 3) mod kOffloadBanks.
+    // Base expert i (in id order) lives in slot (5i + 3) mod kOffloadBanks.
     int offload_slot(int expert) const {
-        for (std::size_t i = 0; i < experts_.size(); ++i) {
-            if (experts_[i].id == expert) {
-                return static_cast<int>((5 * i + 3) % static_cast<std::size_t>(kOffloadBanks));
-            }
-        }
-        return -1;
+        const int index = offload_index(expert);
+        return index < 0 ? -1 : (5 * index + 3) % kOffloadBanks;
     }
 };
 
@@ -809,6 +833,14 @@ int run_profile(const CodecProfile& profile) {
         if (fixture.supports_offload()) {
             failures += fixture.run(tokens, index == 0 ? 1 : 0, false, Residency::Offloaded);
             failures += fixture.run(tokens, index == 0 ? 1 : 0, false, Residency::OffloadedCold);
+        }
+    }
+    // Routing spread over every expert: at the edges of the adaptive range (47..51 for a Q5
+    // routed down, 47..52 for Q6) the device takes the fixed-token route, above it the grouped one.
+    if (profile.routed_down != QType::W8G32_F16S) {
+        const std::int32_t adaptive_last = profile.routed_down == QType::Q6G64_F16S ? 52 : 51;
+        for (const std::int32_t tokens : {std::int32_t{47}, adaptive_last, adaptive_last + 1, std::int32_t{768}}) {
+            failures += fixture.run(tokens, 0, false, Residency::Resident, /*spread=*/true);
         }
     }
     const std::size_t interval = ops::sparse_moe_workspace_capacity_bytes(

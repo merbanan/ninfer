@@ -1774,8 +1774,12 @@ __global__ __launch_bounds__(Q5VoltaMmaSchedule::kThreads, 8) void sparse_moe_pr
 }
 
 // activation[slot][r] = silu(gate_up[slot][r]) * gate_up[slot][512 + r], BF16 in and out.
+// Skips when the adaptive route took the call (negative job count), like the grouped kernels:
+// the fixed-token route owns `activation`'s storage then.
 __global__ void sparse_moe_prefill_swiglu_kernel(const __nv_bfloat16* __restrict__ gate_up,
-                                                 __nv_bfloat16* __restrict__ activation, int assignments) {
+                                                 __nv_bfloat16* __restrict__ activation, int assignments,
+                                                 const int* __restrict__ route_job_count) {
+    if (route_job_count != nullptr && *route_job_count < 0) { return; }
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= static_cast<std::int64_t>(assignments) * kIntermediate) { return; }
     const std::int64_t slot = i / kIntermediate;
@@ -2019,8 +2023,10 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         // BN as the scan was told to use, so the column tiling matches exactly.
         const int max_route_jobs = assignments / 32 + 256;
         const int tiles_per_job  = route_job_bn / kMmaTile;
-        const bool mma           = prefill_mma_enabled() && !adaptive &&
-                                   weights.routed_gate_up.qtype == QType::Q4G64_F16S;
+        // The grouped tensor-core kernels see a negative job count and exit when the adaptive
+        // route takes the call on the device, exactly as the SIMT ones do.
+        const bool mma           = prefill_mma_enabled() && weights.routed_gate_up.qtype == QType::Q4G64_F16S;
+        // The shared-expert GEMM has no such device-side guard; the adaptive range keeps SIMT.
         const bool shared_mma    = prefill_mma_enabled() && !adaptive;
         if (mma) {
             auto* gate_up_out = static_cast<__nv_bfloat16*>(workspace.routed_gate_up.data);
@@ -2030,12 +2036,12 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                 grouped_io, offsets, route_job_experts, route_job_columns, route_job_count, bank_of_expert,
                 tiles_per_job, routed_gate_codes, routed_gate_scales, gate_up_out);
             CUDA_CHECK(cudaGetLastError());
-            // The adaptive route owns this storage for its FP32 reduction; its grouped jobs are empty.
-            if (!adaptive) {
-                const std::int64_t elements = static_cast<std::int64_t>(assignments) * kIntermediate;
-                sparse_moe_prefill_swiglu_kernel<<<static_cast<unsigned>((elements + 255) / 256), 256, 0,
-                                                   stream>>>(gate_up_out, routed_activation, assignments);
-            }
+            // Whether the grouped or the adaptive route runs is decided on the device (the
+            // sign of route_job_count), so the SwiGLU pass launches either way and checks it.
+            const std::int64_t elements = static_cast<std::int64_t>(assignments) * kIntermediate;
+            sparse_moe_prefill_swiglu_kernel<<<static_cast<unsigned>((elements + 255) / 256), 256, 0,
+                                               stream>>>(gate_up_out, routed_activation, assignments,
+                                                         adaptive ? route_job_count : nullptr);
         } else if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_simt_kernel<64>
@@ -2095,7 +2101,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                         2 * kIntermediate, stream);
                 const std::int64_t elements = static_cast<std::int64_t>(tokens) * kIntermediate;
                 sparse_moe_prefill_swiglu_kernel<<<static_cast<unsigned>((elements + 255) / 256), 256, 0,
-                                                   stream>>>(scratch, shared_activation, tokens);
+                                                   stream>>>(scratch, shared_activation, tokens, nullptr);
             } else if (adaptive) {
                 sparse_moe_prefill_w8_shared_gate_up_simt_kernel<kSimtBN, true>
                     <<<grid, kSimtThreads, 0, stream>>>(input, shared_gate_codes,
