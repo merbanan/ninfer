@@ -16,6 +16,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 // The staging switch below reads the environment; these were relied on
 // transitively before and are now named explicitly.
@@ -1955,6 +1956,24 @@ void flash_next_moe_kernels_launch(const Tensor& input, const MoeWeights& weight
         launch_down_decode(flash_next_moe_down_kernel_selection(), weights, workspace, tokens,
                            output, stream);
     } else {
+#if defined(NINFER_VOLTA_BUILD)
+        // The SIMT arm runs long calls in token slices (see kFlashNextSimtMoeTokens); routing is
+        // per token, so each slice is an independent call on the matching columns.
+        if (tokens > kFlashNextSimtMoeTokens) {
+            for (int first = 0; first < tokens; first += kFlashNextSimtMoeTokens) {
+                const int count             = std::min(kFlashNextSimtMoeTokens, tokens - first);
+                const Tensor slice_input    = input.slice(1, first, count);
+                Tensor slice_output         = output.slice(1, first, count);
+                FlashNextMoeWorkspace slice = workspace;
+                slice.ids                   = workspace.ids.slice(1, first, count);
+                slice.alpha                 = workspace.alpha.slice(1, first, count);
+                slice.shared_scale          = workspace.shared_scale.slice(0, first, count);
+                slice.activations           = workspace.activations.slice(2, first, count);
+                flash_next_moe_kernels_launch(slice_input, weights, slice, slice_output, stream);
+            }
+            return;
+        }
+#endif
         // Prefill path (tokens > 8): Group tokens by expert, load weights once per chunk
         // 1. Group tokens by expert and build active expert list
         if (flash_next_moe_shared_mma_enabled()) {

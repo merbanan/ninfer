@@ -41,6 +41,10 @@ struct FlashNextMoeWorkspace {
     const std::int32_t* expert_slots = nullptr;
 };
 
+// The SIMT arm processes prefill calls in slices of at most this many tokens, so its FP32 routed
+// intermediate ([2560, 10, T], 105 MB per 1024 tokens) stays bounded for long prefill chunks.
+inline constexpr std::int32_t kFlashNextSimtMoeTokens = 2048;
+
 // True when prefill always takes the SIMT arm (the sm_70 build, which lacks the NVFP4 MMA
 // route); its FP32 routed intermediate is then carved at every token count.
 [[nodiscard]] bool flash_next_moe_prefill_simt_only() noexcept;
@@ -74,14 +78,20 @@ FlashNextMoeWorkspace allocate_flash_next_moe_workspace(Arena& arena, std::int32
             const std::int32_t staged_columns       = std::max(10 * tokens, kSimtTailColumns);
             out.staged_down   = arena.alloc(DType::BF16, {2'560, staged_columns}, 256);
         } else {
-            out.down_intermediate = arena.alloc(DType::FP32, {2'560, 10, tokens}, 256);
+            const std::int32_t slice = flash_next_moe_prefill_simt_only()
+                                           ? std::min(tokens, kFlashNextSimtMoeTokens)
+                                           : tokens;
+            out.down_intermediate = arena.alloc(DType::FP32, {2'560, 10, slice}, 256);
         }
         out.task_counter      = arena.alloc(DType::I32, {4}, 16);
-        out.act_codes         = arena.alloc(DType::U8, {1'280, tokens}, 256);
-        out.act_scales        = arena.alloc(DType::U8, {160, tokens}, 256);
-        out.down_act_codes    = arena.alloc(DType::U8, {320, 11 * tokens}, 256);
-        out.down_act_scales   = arena.alloc(DType::U8, {40, 11 * tokens}, 256);
-        out.shared_gemm       = arena.alloc(DType::BF16, {640, 2 * tokens}, 256);
+        if (!flash_next_moe_prefill_simt_only()) {
+            // NVFP4 activation codes and the packed shared GEMM input of the MMA arm.
+            out.act_codes       = arena.alloc(DType::U8, {1'280, tokens}, 256);
+            out.act_scales      = arena.alloc(DType::U8, {160, tokens}, 256);
+            out.down_act_codes  = arena.alloc(DType::U8, {320, 11 * tokens}, 256);
+            out.down_act_scales = arena.alloc(DType::U8, {40, 11 * tokens}, 256);
+            out.shared_gemm     = arena.alloc(DType::BF16, {640, 2 * tokens}, 256);
+        }
     }
     return out;
 }

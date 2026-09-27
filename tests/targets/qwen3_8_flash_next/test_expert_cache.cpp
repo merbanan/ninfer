@@ -138,7 +138,7 @@ int main() {
         bank->mapped_payload_bytes = 1;
     }
 
-    constexpr int kMaxTokens = 1024;
+    constexpr int kMaxTokens = 4096;
     DeviceArena workspace(flash_next_moe_workspace_capacity_bytes(1, kMaxTokens) + (1U << 20));
     DeviceArena io((static_cast<std::size_t>(kHidden) * kMaxTokens * 2 + 4096) * 3);
     cudaStream_t stream = nullptr;
@@ -205,7 +205,7 @@ int main() {
     run(x64, 64, "prefill again (cached)", true);
     // Optional timing of the device-resident MoE (NINFER_TEST_TIME_MOE=1).
     if (const char* t = std::getenv("NINFER_TEST_TIME_MOE"); t != nullptr && t[0] == '1') {
-        for (int tokens : {1, 16, 64, 256, 1024}) {
+        for (int tokens : {1, 16, 64, 256, 1024, 4096}) {
             io.reset();
             const auto x = random_x(tokens);
             Tensor input  = io.alloc(DType::BF16, {kHidden, tokens});
