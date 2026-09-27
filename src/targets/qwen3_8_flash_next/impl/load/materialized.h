@@ -8,10 +8,23 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <vector>
 
 namespace ninfer::targets::qwen3_8_flash_next::detail {
+
+// Pinned host memory mapped into the device address space (read by kernels over PCIe).
+struct MappedHostBuffer {
+    void* host         = nullptr;
+    void* device       = nullptr;
+    std::size_t bytes  = 0;
+    MappedHostBuffer() = default;
+    explicit MappedHostBuffer(std::size_t size);
+    ~MappedHostBuffer();
+    MappedHostBuffer(const MappedHostBuffer&)            = delete;
+    MappedHostBuffer& operator=(const MappedHostBuffer&) = delete;
+};
 
 class LoadedModelData {
 public:
@@ -27,6 +40,9 @@ public:
     artifact::MaterializedArtifact backing;
     DeviceBuffer output_head_fp8;
     DeviceBuffer token_embedding_fp8;
+    // The FP8 token embedding in host memory instead (sm_70 build on small cards, see
+    // flash_next_host_embedding): the gather reads one 2.5 KB row per token over PCIe.
+    std::unique_ptr<MappedHostBuffer> token_embedding_host;
     DeviceBuffer mtp_expert_gate_up_nvfp4;
     DeviceBuffer mtp_expert_down_nvfp4;
     DeviceBuffer proposal_head_payload;

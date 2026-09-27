@@ -180,20 +180,20 @@ void quantize_bf16_head_to_fp8_e4m3_row_f32s(const Weight& bf16_head, DeviceBuff
     quantize_bf16_rows_to_fp8_e4m3_row_f32s(bf16_head.qdata, payload, fp8_head, rows, cols, stream);
 }
 
-void quantize_bf16_rows_to_fp8_e4m3_row_f32s(const void* bf16_rows, DeviceBuffer& payload,
+void quantize_bf16_rows_to_fp8_e4m3_row_f32s(const void* bf16_rows, void* payload_data, std::size_t payload_bytes,
                                              Weight& fp8_out, std::int32_t rows, std::int32_t cols,
                                              cudaStream_t stream) {
     if (bf16_rows == nullptr || rows <= 0 || cols <= 0 || (cols % 2) != 0) {
         throw std::invalid_argument("Flash-Next FP8 quantize received invalid dimensions");
     }
     const std::size_t bytes = flash_next_fp8_head_payload_bytes(rows, cols);
-    if (payload.p == nullptr || payload.bytes < bytes) {
+    if (payload_data == nullptr || payload_bytes < bytes) {
         throw std::invalid_argument("Flash-Next FP8 head payload is too small");
     }
     const std::uint64_t codes        = static_cast<std::uint64_t>(rows) * cols;
     const std::uint64_t scale_offset = (codes + 255U) & ~std::uint64_t{255U};
-    auto* code_ptr                   = static_cast<std::uint8_t*>(payload.p);
-    auto* scale_ptr = reinterpret_cast<__nv_bfloat16*>(static_cast<std::byte*>(payload.p) + scale_offset);
+    auto* code_ptr                   = static_cast<std::uint8_t*>(payload_data);
+    auto* scale_ptr = reinterpret_cast<__nv_bfloat16*>(static_cast<std::byte*>(payload_data) + scale_offset);
 
     cudaPointerAttributes attributes{};
     const cudaError_t pointer_status = cudaPointerGetAttributes(&attributes, bf16_rows);
@@ -230,7 +230,13 @@ void quantize_bf16_rows_to_fp8_e4m3_row_f32s(const void* bf16_rows, DeviceBuffer
         }
         CUDA_CHECK(cudaStreamSynchronize(stream)); // `stage` is freed as this scope exits
     }
-    fp8_out = make_fp8_view_sized(payload.p, payload.bytes, rows, cols);
+    fp8_out = make_fp8_view_sized(payload_data, payload_bytes, rows, cols);
+}
+
+void quantize_bf16_rows_to_fp8_e4m3_row_f32s(const void* bf16_rows, DeviceBuffer& payload,
+                                             Weight& fp8_out, std::int32_t rows, std::int32_t cols,
+                                             cudaStream_t stream) {
+    quantize_bf16_rows_to_fp8_e4m3_row_f32s(bf16_rows, payload.p, payload.bytes, fp8_out, rows, cols, stream);
 }
 
 void gather_head_rows_bf16(const Weight& src_head, const std::int32_t* token_ids,

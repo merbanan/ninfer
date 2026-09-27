@@ -28,6 +28,11 @@ inline constexpr std::int32_t kOutputHeadColumns = 2'560;
 void quantize_bf16_rows_to_fp8_e4m3_row_f32s(const void* bf16_rows, DeviceBuffer& payload,
                                              Weight& fp8_out, std::int32_t rows, std::int32_t cols,
                                              cudaStream_t stream);
+// Same into caller storage: device memory or mapped pinned host memory (its device pointer).
+void quantize_bf16_rows_to_fp8_e4m3_row_f32s(const void* bf16_rows, void* payload_data,
+                                             std::size_t payload_bytes, Weight& fp8_out,
+                                             std::int32_t rows, std::int32_t cols,
+                                             cudaStream_t stream);
 
 void quantize_bf16_output_head_to_fp8_e4m3_row_f32s(const Weight& bf16_head, DeviceBuffer& payload,
                                                     Weight& fp8_head, cudaStream_t stream);

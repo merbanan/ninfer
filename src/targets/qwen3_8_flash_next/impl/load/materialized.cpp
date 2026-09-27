@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -87,6 +88,23 @@ Weight bf16_weight(const artifact::MaterializedArtifact& backing, artifact::Obje
                    std::int32_t rows, std::int32_t columns) {
     return artifact::materialized_weight(backing, handle, NumericFormat::BF16, rows, columns);
 }
+
+bool env_flag(const char* name, bool fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') { return fallback; }
+    return std::strcmp(value, "0") != 0;
+}
+
+#if defined(NINFER_VOLTA_BUILD)
+constexpr bool kSmallCardDefaults = true;
+#else
+constexpr bool kSmallCardDefaults = false;
+#endif
+
+// NINFER_FLASH_NEXT_HOST_EMBEDDING (default on in the sm_70 build).
+bool flash_next_host_embedding() { return env_flag("NINFER_FLASH_NEXT_HOST_EMBEDDING", kSmallCardDefaults); }
+// NINFER_FLASH_NEXT_PLE_WARM (default off in the sm_70 build).
+bool flash_next_ple_warm() { return env_flag("NINFER_FLASH_NEXT_PLE_WARM", !kSmallCardDefaults); }
 
 // FP8 weights consumed by ops::linear: the sm_70 build's QPN kernels read the load-time permuted
 // code stream. Never applied to the FP8 token embedding, which the gather reads row-major.
@@ -281,6 +299,15 @@ MtpModelView load_mtp(const MtpPlan& plan, const artifact::MaterializedArtifact&
 
 } // namespace
 
+MappedHostBuffer::MappedHostBuffer(std::size_t size) : bytes(size) {
+    CUDA_CHECK(cudaHostAlloc(&host, size, cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostGetDevicePointer(&device, host, 0));
+}
+
+MappedHostBuffer::~MappedHostBuffer() {
+    if (host != nullptr) { (void)cudaFreeHost(host); }
+}
+
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
                                  bool quantize_output_head_fp8,
                                  bool quantize_token_embedding_fp8)
@@ -296,7 +323,15 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     const bool embedding_mapped = plan.features.quantize_token_embedding_fp8;
     const bool head_mapped      = plan.features.quantize_output_head_fp8;
 
-    if (embedding_mapped) {
+    if (embedding_mapped && flash_next_host_embedding()) {
+        token_embedding_host = std::make_unique<MappedHostBuffer>(
+            flash_next_fp8_head_payload_bytes(248'320, 2'560));
+        quantize_bf16_rows_to_fp8_e4m3_row_f32s(
+            mapped_bf16_rows(backing, plan.token_embedding, 248'320, 2'560).data(),
+            token_embedding_host->device, token_embedding_host->bytes, text.token_embedding, 248'320,
+            2'560, cudaStream_t{});
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } else if (embedding_mapped) {
         token_embedding_fp8 = DeviceBuffer(flash_next_fp8_head_payload_bytes(248'320, 2'560));
         quantize_bf16_rows_to_fp8_e4m3_row_f32s(
             mapped_bf16_rows(backing, plan.token_embedding, 248'320, 2'560).data(),
@@ -428,6 +463,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     // PLE is a random-access host weight table. Leaving its mapped pages cold makes
     // the first code prompt pay thousands of synchronous disk faults per token batch.
     // Warm only these persistent host weights after device materialization, before ready.
+    // On hosts whose RAM cannot hold the table beside the routed experts (the sm_70 build's
+    // offload setup) the 32 GB warm evicts expert pages instead, so there it is opt-in
+    // (NINFER_FLASH_NEXT_PLE_WARM=1).
+    if (!flash_next_ple_warm()) { return; }
     const auto warm_started = std::chrono::steady_clock::now();
     std::size_t host_bytes = 0;
     for (const auto& shard : text.ple.table.shards) {

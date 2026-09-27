@@ -25,7 +25,7 @@ namespace ninfer::targets::qwen3_8_flash_next::detail {
 struct FlashNextOffloadPolicy {
     // Device bytes of the expert cache; 0 takes the free device memory less `reserve_mib`.
     std::size_t cache_bytes = 0;
-    std::size_t reserve_mib = 384;
+    std::size_t reserve_mib = 128;
     // Calls of at most this many tokens compute the experts the cache misses on the host
     // (0 disables: every miss is uploaded before use).
     std::int32_t host_max_tokens = 8;
