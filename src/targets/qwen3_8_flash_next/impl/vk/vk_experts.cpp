@@ -97,6 +97,9 @@ struct FlashNextVkExperts::Impl {
     VkDescriptorSet desc_set          = VK_NULL_HANDLE;
 
     Buffer slot_pool, x_buf, jobs_buf, act_buf, out_buf;
+    // Device-local copies the shaders read (the host-visible originals live in system RAM, which
+    // the RX 570 would otherwise read across PCIe for every element).
+    Buffer x_dev, jobs_dev;
     std::array<Buffer, kPromoBuffers> staging{};
     std::array<VkCommandBuffer, kPromoBuffers> promo_cmd{};
     std::array<VkFence, kPromoBuffers> promo_fence{};
@@ -107,6 +110,7 @@ struct FlashNextVkExperts::Impl {
     struct Slot {
         std::int64_t key        = -1;
         std::uint64_t last_used = 0;
+        std::uint32_t frequency = 0; // hits, halved every kDecayCalls submits
         bool pending             = false;
     };
     struct Promotion {
@@ -118,6 +122,7 @@ struct FlashNextVkExperts::Impl {
     std::unordered_map<std::int64_t, std::uint32_t> resident;
     std::vector<Promotion> promotions;
     std::uint64_t clock = 0;
+    std::uint64_t submits = 0;
 
     bool pending_submit = false;
 
@@ -131,6 +136,8 @@ struct FlashNextVkExperts::Impl {
         };
         destroy_buffer(slot_pool);
         destroy_buffer(x_buf);
+        destroy_buffer(x_dev);
+        destroy_buffer(jobs_dev);
         destroy_buffer(jobs_buf);
         destroy_buffer(act_buf);
         destroy_buffer(out_buf);
@@ -249,6 +256,11 @@ FlashNextVkPolicy FlashNextVkPolicy::from_environment() {
     out.cache_bytes       = static_cast<std::size_t>(env_u32("NINFER_FLASH_NEXT_VK_CACHE_MB", 0)) << 20;
     out.reserve_mib       = env_u32("NINFER_FLASH_NEXT_VK_RESERVE_MB", static_cast<std::uint32_t>(out.reserve_mib));
     out.promote_per_call = env_u32("NINFER_FLASH_NEXT_VK_PROMOTE", out.promote_per_call);
+    out.admit_misses      = std::max(1U, env_u32("NINFER_FLASH_NEXT_VK_ADMIT", out.admit_misses));
+    out.pin               = env_u32("NINFER_FLASH_NEXT_VK_PIN", out.pin ? 1U : 0U) != 0;
+    if (const char* v = std::getenv("NINFER_FLASH_NEXT_VK_PIN_PROFILE"); v != nullptr && v[0] != '\0') {
+        out.pin_profile = v;
+    }
     out.report            = env_u32("NINFER_FLASH_NEXT_OFFLOAD_STATS", 0) != 0;
     return out;
 }
@@ -399,9 +411,15 @@ std::unique_ptr<FlashNextVkExperts> FlashNextVkExperts::create(const MoeWeights&
                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                      device_local, false);
         impl->x_buf = make_buffer(impl->device, mem_props, std::size_t{kMaxTokens} * kHidden * sizeof(float),
-                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, true);
+                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT, host, true);
         impl->jobs_buf = make_buffer(impl->device, mem_props, std::size_t{kMaxJobs} * sizeof(GpuJob),
-                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, true);
+                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT, host, true);
+        impl->x_dev = make_buffer(impl->device, mem_props, impl->x_buf.bytes,
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, device_local,
+                                  false);
+        impl->jobs_dev = make_buffer(impl->device, mem_props, impl->jobs_buf.bytes,
+                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                     device_local, false);
         impl->act_buf = make_buffer(impl->device, mem_props,
                                     std::size_t{kMaxJobs} * kMaxTokens * kIntermediate * sizeof(float),
                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, device_local, false);
@@ -450,7 +468,7 @@ std::unique_ptr<FlashNextVkExperts> FlashNextVkExperts::create(const MoeWeights&
         desc_alloc_info.pSetLayouts        = &impl->set_layout;
         VK_CHECK(vkAllocateDescriptorSets(impl->device, &desc_alloc_info, &impl->desc_set));
 
-        const std::array<Buffer*, 5> set_buffers{&impl->slot_pool, &impl->x_buf, &impl->jobs_buf, &impl->act_buf,
+        const std::array<Buffer*, 5> set_buffers{&impl->slot_pool, &impl->x_dev, &impl->jobs_dev, &impl->act_buf,
                                                  &impl->out_buf};
         std::array<VkDescriptorBufferInfo, 5> buffer_infos{};
         std::array<VkWriteDescriptorSet, 5> writes{};
@@ -506,6 +524,19 @@ void FlashNextVkExperts::submit(std::span<const FlashNextVkJob> jobs, const std:
         }
     }
 
+    // Hit frequencies for the admission test; halved every kDecayCalls submits (~a few dozen
+    // decode tokens of 48 layers) so the tier follows the routing.
+    constexpr std::uint64_t kDecayCalls = 2048;
+    ++impl.clock;
+    for (const auto& job : jobs) {
+        auto& slot     = impl.slot[job.slot];
+        slot.frequency = std::min<std::uint32_t>(slot.frequency + 1, 1U << 20);
+        slot.last_used = impl.clock;
+    }
+    if (++impl.submits % kDecayCalls == 0) {
+        for (auto& slot : impl.slot) { slot.frequency /= 2; }
+    }
+
     auto* gpu_jobs = static_cast<GpuJob*>(impl.jobs_buf.mapped);
     std::memset(gpu_jobs, 0, impl.jobs_buf.bytes);
     if (jobs.size() > kMaxJobs) { throw std::logic_error("Flash-Next Vulkan expert tier: too many jobs in one call"); }
@@ -530,10 +561,22 @@ void FlashNextVkExperts::submit(std::span<const FlashNextVkJob> jobs, const std:
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(impl.compute_cmd, &begin_info));
+    {
+        const VkBufferCopy x_copy{0, 0, static_cast<VkDeviceSize>(tokens) * kHidden * sizeof(float)};
+        vkCmdCopyBuffer(impl.compute_cmd, impl.x_buf.buffer, impl.x_dev.buffer, 1, &x_copy);
+        const VkBufferCopy jobs_copy{0, 0, impl.jobs_buf.bytes};
+        vkCmdCopyBuffer(impl.compute_cmd, impl.jobs_buf.buffer, impl.jobs_dev.buffer, 1, &jobs_copy);
+        VkMemoryBarrier copied{};
+        copied.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(impl.compute_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                             1, &copied, 0, nullptr, 0, nullptr);
+    }
     vkCmdBindDescriptorSets(impl.compute_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl.pipeline_layout, 0, 1,
                             &impl.desc_set, 0, nullptr);
     vkCmdBindPipeline(impl.compute_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl.gate_up_pipeline);
-    vkCmdDispatch(impl.compute_cmd, kMaxJobs, kIntermediate / 64, 1);
+    vkCmdDispatch(impl.compute_cmd, kMaxJobs, kIntermediate, 1); // (job, gate/up pair)
 
     VkMemoryBarrier barrier{};
     barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -543,7 +586,7 @@ void FlashNextVkExperts::submit(std::span<const FlashNextVkJob> jobs, const std:
                         0, 1, &barrier, 0, nullptr, 0, nullptr);
 
     vkCmdBindPipeline(impl.compute_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl.down_pipeline);
-    vkCmdDispatch(impl.compute_cmd, kHidden / 64, 1, 1);
+    vkCmdDispatch(impl.compute_cmd, kHidden / 4, 1, 1); // 4 output rows per workgroup
     VK_CHECK(vkEndCommandBuffer(impl.compute_cmd));
 
     VkSubmitInfo submit_info{};
@@ -557,18 +600,30 @@ void FlashNextVkExperts::submit(std::span<const FlashNextVkJob> jobs, const std:
 void FlashNextVkExperts::wait(float* accumulate_into, std::int32_t tokens) {
     if (!impl_->pending_submit) { return; }
     const auto start = std::chrono::steady_clock::now();
-    VK_CHECK(vkWaitForFences(impl_->device, 1, &impl_->compute_fence, VK_TRUE, UINT64_MAX));
+    // Spin briefly: the dispatch usually finishes while the CPU computes its own experts, and a
+    // blocking fence wait costs a kernel wake-up (tens of microseconds) on every call.
+    VkResult status = vkGetFenceStatus(impl_->device, impl_->compute_fence);
+    while (status == VK_NOT_READY &&
+           std::chrono::steady_clock::now() - start < std::chrono::microseconds(200)) {
+        status = vkGetFenceStatus(impl_->device, impl_->compute_fence);
+    }
+    if (status == VK_NOT_READY) {
+        VK_CHECK(vkWaitForFences(impl_->device, 1, &impl_->compute_fence, VK_TRUE, UINT64_MAX));
+    } else {
+        VK_CHECK(status);
+    }
     impl_->pending_submit = false;
     stats_.submit_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     const auto* out = static_cast<const float*>(impl_->out_buf.mapped);
     for (std::size_t i = 0; i < static_cast<std::size_t>(tokens) * kHidden; ++i) { accumulate_into[i] += out[i]; }
 }
 
-void FlashNextVkExperts::begin_promotion(std::int64_t key, const std::byte* packed) {
+bool FlashNextVkExperts::begin_promotion(std::int64_t key, std::uint32_t candidate_frequency,
+                                         const std::function<void(std::byte*)>& fill) {
     auto& impl = *impl_;
-    if (impl.resident.contains(key)) { return; }
+    if (impl.resident.contains(key)) { return false; }
     for (const auto& p : impl.promotions) {
-        if (p.key == key) { return; }
+        if (p.key == key) { return false; }
     }
     std::size_t buffer = kPromoBuffers;
     for (std::size_t i = 0; i < kPromoBuffers; ++i) {
@@ -577,22 +632,32 @@ void FlashNextVkExperts::begin_promotion(std::int64_t key, const std::byte* pack
             break;
         }
     }
-    if (buffer == kPromoBuffers) { return; }
+    if (buffer == kPromoBuffers) { return false; }
 
-    std::int64_t victim_slot         = -1;
-    std::uint64_t victim_clock       = ~std::uint64_t{0};
+    // Free slot first, else the least frequently used (ties: least recently used).
+    std::int64_t victim_slot = -1;
     for (std::uint32_t s = 0; s < slots_; ++s) {
-        if (impl.slot[s].pending) { continue; }
-        if (impl.slot[s].key < 0) {
+        const auto& slot = impl.slot[s];
+        if (slot.pending) { continue; }
+        if (slot.key < 0) {
             victim_slot = s;
             break;
         }
-        if (impl.slot[s].last_used < victim_clock) {
-            victim_clock = impl.slot[s].last_used;
-            victim_slot  = static_cast<std::int64_t>(s);
+        if (victim_slot < 0) {
+            victim_slot = s;
+            continue;
+        }
+        const auto& best = impl.slot[static_cast<std::size_t>(victim_slot)];
+        if (slot.frequency < best.frequency ||
+            (slot.frequency == best.frequency && slot.last_used < best.last_used)) {
+            victim_slot = s;
         }
     }
-    if (victim_slot < 0) { return; }
+    if (victim_slot < 0) { return false; }
+    {
+        const auto& victim = impl.slot[static_cast<std::size_t>(victim_slot)];
+        if (victim.key >= 0 && victim.frequency >= candidate_frequency) { return false; }
+    }
 
     if (const std::int64_t old_key = impl.slot[static_cast<std::size_t>(victim_slot)].key; old_key >= 0) {
         if (const auto it = impl.resident.find(old_key);
@@ -605,10 +670,11 @@ void FlashNextVkExperts::begin_promotion(std::int64_t key, const std::byte* pack
     slot.key       = key;
     slot.pending   = true;
     slot.last_used = impl.clock;
-
-    std::memcpy(impl.staging[buffer].mapped, packed, packed_bytes_);
+    // A new entry starts at its miss count, so it is not the next victim before it is used.
+    slot.frequency = candidate_frequency;
 
     VK_CHECK(vkWaitForFences(impl.device, 1, &impl.promo_fence[buffer], VK_TRUE, UINT64_MAX));
+    fill(static_cast<std::byte*>(impl.staging[buffer].mapped));
     VK_CHECK(vkResetFences(impl.device, 1, &impl.promo_fence[buffer]));
     VK_CHECK(vkResetCommandBuffer(impl.promo_cmd[buffer], 0));
     VkCommandBufferBeginInfo begin_info{};
@@ -629,6 +695,17 @@ void FlashNextVkExperts::begin_promotion(std::int64_t key, const std::byte* pack
     impl.promo_busy[buffer] = true;
     impl.promotions.push_back({static_cast<std::uint32_t>(victim_slot), key, buffer});
     ++stats_.promotions;
+    return true;
+}
+
+void FlashNextVkExperts::drop(std::int64_t key) {
+    auto& impl = *impl_;
+    const auto it = impl.resident.find(key);
+    if (it == impl.resident.end()) { return; }
+    auto& slot     = impl.slot[it->second];
+    slot.key       = -1;
+    slot.frequency = 0;
+    impl.resident.erase(it);
 }
 
 void FlashNextVkExperts::retire_promotions() {

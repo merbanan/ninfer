@@ -114,7 +114,6 @@ int main() {
     // residency. There are fewer promotion staging buffers than kBankExperts, so a begin_promotion
     // for an expert with no free buffer is a no-op; retry each not-yet-resident, not-yet-in-flight
     // expert every spin, same as expert_cache.cpp does across calls.
-    std::vector<std::byte> packed(vk->packed_bytes());
     for (int spins = 0; spins < 100000; ++spins) {
         vk->retire_promotions();
         bool all_resident = true;
@@ -122,8 +121,9 @@ int main() {
             if (vk->resident(e)) { continue; }
             all_resident = false;
             if (!vk->promotion_in_flight(e)) {
-                pack_expert(weights.expert_gate_up, weights.expert_down, e, packed.data());
-                vk->begin_promotion(e, packed.data());
+                (void)vk->begin_promotion(e, 1, [&](std::byte* staging) {
+                    pack_expert(weights.expert_gate_up, weights.expert_down, e, staging);
+                });
             }
         }
         if (all_resident) { break; }

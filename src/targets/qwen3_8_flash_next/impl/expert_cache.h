@@ -117,6 +117,8 @@ private:
 
     void allocate(const MoeWeights& weights);
     [[nodiscard]] int layer_of(const MoeWeights& weights);
+    // Pinned RX 570 mode: uploads this layer's fixed expert set (blocking, once per layer).
+    void pin_vk_layer(int layer, const MoeWeights& weights);
     void decode(int layer, const Tensor& input, const MoeWeights& weights, FlashNextMoeWorkspace& scratch,
                 Tensor& output, cudaStream_t stream);
     void prefill(int layer, const Tensor& input, const MoeWeights& weights, FlashNextMoeWorkspace& scratch,

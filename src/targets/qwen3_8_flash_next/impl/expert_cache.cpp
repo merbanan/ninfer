@@ -185,8 +185,58 @@ int FlashNextExpertCache::layer_of(const MoeWeights& weights) {
     if (inserted) {
         miss_counts_.resize(layers_.size() * kExperts, 0);
         layer_calls_.resize(layers_.size(), 0);
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+        if (vk_ && vk_->policy().pin) { pin_vk_layer(it->second, weights); }
+#endif
     }
     return it->second;
+}
+
+void FlashNextExpertCache::pin_vk_layer(int layer, const MoeWeights& weights) {
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+    constexpr int kTextLayers = 48;
+    const std::uint32_t per_layer = vk_->slot_count() / kTextLayers;
+    if (per_layer == 0 || layer >= kTextLayers) { return; }
+    // Expert choice: highest counts of the profile row, else evenly spaced ids.
+    std::vector<std::int32_t> chosen;
+    static const std::vector<float> profile = [&] {
+        std::vector<float> counts;
+        if (const char* path = vk_->policy().pin_profile; path != nullptr) {
+            if (std::FILE* f = std::fopen(path, "rb")) {
+                counts.resize(static_cast<std::size_t>(kTextLayers) * kExperts);
+                if (std::fread(counts.data(), sizeof(float), counts.size(), f) != counts.size()) { counts.clear(); }
+                std::fclose(f);
+            }
+            if (counts.empty()) { std::fprintf(stderr, "[flash-next vk] pin profile %s unreadable, using spaced ids\n", path); }
+        }
+        return counts;
+    }();
+    if (!profile.empty()) {
+        std::vector<std::int32_t> order(kExperts);
+        for (int e = 0; e < kExperts; ++e) { order[static_cast<std::size_t>(e)] = e; }
+        const float* row = profile.data() + static_cast<std::size_t>(layer) * kExperts;
+        std::stable_sort(order.begin(), order.end(), [&](std::int32_t a, std::int32_t b) { return row[a] > row[b]; });
+        chosen.assign(order.begin(), order.begin() + per_layer);
+    } else {
+        for (std::uint32_t i = 0; i < per_layer; ++i) {
+            chosen.push_back(static_cast<std::int32_t>((i * kExperts / per_layer + layer * 7) % kExperts));
+        }
+    }
+    for (const std::int32_t e : chosen) {
+        const std::int64_t key = static_cast<std::int64_t>(layer) * kExperts + e;
+        // Pinned entries carry the largest frequency, so nothing ever displaces them.
+        while (!vk_->begin_promotion(key, ~std::uint32_t{0} >> 1, [&](std::byte* staging) {
+            pack(weights, std::span<const std::int32_t>(&e, 1), staging);
+        })) {
+            if (vk_->resident(key) || vk_->promotion_in_flight(key)) { break; }
+            vk_->retire_promotions();
+        }
+    }
+    vk_->retire_promotions();
+#else
+    (void)layer;
+    (void)weights;
+#endif
 }
 
 void FlashNextExpertCache::will_need(const MoeWeights& weights, std::span<const std::int32_t> experts) const {
@@ -332,6 +382,17 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
 #if defined(NINFER_FLASH_NEXT_VULKAN)
     if (vk_) { vk_->retire_promotions(); }
 #endif
+    // NINFER_FLASH_NEXT_ROUTE_TRACE=<file>: appends (layer, tokens, ids[tokens * 10]) as int32 per
+    // decode call, for offline analysis of the routing (cache sizing and placement studies).
+    static std::FILE* route_trace = [] {
+        const char* path = std::getenv("NINFER_FLASH_NEXT_ROUTE_TRACE");
+        return path != nullptr && path[0] != '\0' ? std::fopen(path, "wb") : nullptr;
+    }();
+    if (route_trace != nullptr) {
+        const std::int32_t header[2] = {layer, tokens};
+        std::fwrite(header, sizeof(header), 1, route_trace);
+        std::fwrite(ids, sizeof(std::int32_t), n, route_trace);
+    }
 
     // Distinct experts of the call, with their routed (column, weight) pairs. Non-CUDA-resident
     // experts go to the RX 570 tier when it holds them, else the CPU.
@@ -449,6 +510,10 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
         std::vector<std::pair<std::uint16_t, std::int32_t>> candidates; // (misses, expert)
         for (std::size_t i = 0; i < experts.size(); ++i) {
             if (slot_of_expert[i] >= 0) { continue; }
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+            // Served by the RX 570 already: no CUDA slot for it.
+            if (vk_ && vk_->resident(static_cast<std::int64_t>(layer) * kExperts + experts[i])) { continue; }
+#endif
             auto& misses = miss_counts_[static_cast<std::size_t>(layer) * kExperts + experts[i]];
             misses = static_cast<std::uint16_t>(std::min<int>(misses + 1, 0xFFFF));
             if (misses >= policy_.admit_misses) { candidates.emplace_back(misses, experts[i]); }
@@ -489,6 +554,10 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
             promotion_busy_[buffer] = true;
             promotions_.push_back({static_cast<std::uint32_t>(v), key, buffer});
             miss_counts_[static_cast<std::size_t>(layer) * kExperts + e] = 0;
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+            // The CUDA cache is checked first: an RX 570 copy would only take a slot.
+            if (vk_) { vk_->drop(key); }
+#endif
             ++stats_.promotions;
             ++issued;
         }
@@ -498,23 +567,26 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
     // already RX 570-resident), the most CUDA-missed go to a free/LRU Vulkan slot. Reuses the same
     // miss counters as the CUDA promotions above; not reset here, so a Vulkan-resident expert can
     // still graduate to the (faster) CUDA cache later.
-    if (vk_ && !cold.empty()) {
+    if (vk_ && !vk_->policy().pin && !cold.empty()) {
         std::vector<std::pair<std::uint16_t, std::int32_t>> vk_candidates; // (misses, expert)
         for (const std::int32_t e : cold_expert_id) {
             const auto misses = miss_counts_[static_cast<std::size_t>(layer) * kExperts + e];
-            if (misses >= policy_.admit_misses) { vk_candidates.emplace_back(misses, e); }
+            if (misses >= vk_->policy().admit_misses) { vk_candidates.emplace_back(misses, e); }
         }
         std::sort(vk_candidates.begin(), vk_candidates.end(),
                   [](const auto& a, const auto& b) { return a.first > b.first; });
         std::uint32_t issued = 0;
-        std::vector<std::byte> packed(vk_->packed_bytes());
         for (const auto& [misses, e] : vk_candidates) {
             if (issued >= vk_->policy().promote_per_call || !vk_->has_free_promotion_slot()) { break; }
             const std::int64_t key = static_cast<std::int64_t>(layer) * kExperts + e;
             if (vk_->resident(key) || vk_->promotion_in_flight(key)) { continue; }
-            pack(weights, std::span<const std::int32_t>(&e, 1), packed.data());
-            vk_->begin_promotion(key, packed.data());
-            ++issued;
+            // Packed straight into the Vulkan staging buffer, and only once admitted.
+            const std::int32_t expert = e;
+            if (vk_->begin_promotion(key, misses, [&](std::byte* staging) {
+                    pack(weights, std::span<const std::int32_t>(&expert, 1), staging);
+                })) {
+                ++issued;
+            }
         }
     }
 #endif

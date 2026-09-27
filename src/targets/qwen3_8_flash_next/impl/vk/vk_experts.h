@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -20,7 +21,17 @@ struct FlashNextVkPolicy {
     std::size_t cache_bytes   = 0;    // NINFER_FLASH_NEXT_VK_CACHE_MB; 0 takes the reported
                                        // VK_EXT_memory_budget less reserve_mib
     std::size_t reserve_mib   = 256;  // NINFER_FLASH_NEXT_VK_RESERVE_MB
-    std::uint32_t promote_per_call = 2; // NINFER_FLASH_NEXT_VK_PROMOTE
+    std::uint32_t promote_per_call = 1; // NINFER_FLASH_NEXT_VK_PROMOTE
+    // CPU misses (the shared counters, halved every 64 calls of a layer) an expert needs before it
+    // is considered for this tier: each promotion costs a 2.76 MB host copy on the decode thread.
+    std::uint32_t admit_misses = 8; // NINFER_FLASH_NEXT_VK_ADMIT
+    // Pinned mode (default): each layer's share of the slots holds a fixed expert set, uploaded
+    // when the layer is first seen and never replaced (no promotions). The set is the most
+    // routed experts of a per-layer count profile (NINFER_FLASH_NEXT_VK_PIN_PROFILE: raw FP32
+    // [48][512]) or, without one, evenly spaced expert ids. NINFER_FLASH_NEXT_VK_PIN=0 selects
+    // the promoting cache instead.
+    bool pin = true;                  // NINFER_FLASH_NEXT_VK_PIN
+    const char* pin_profile = nullptr; // NINFER_FLASH_NEXT_VK_PIN_PROFILE
     bool report                    = false; // NINFER_FLASH_NEXT_OFFLOAD_STATS
 
     [[nodiscard]] static FlashNextVkPolicy from_environment();
@@ -83,12 +94,17 @@ public:
     // caller zeroes accumulate_into first when nothing else already wrote it this call.
     void wait(float* accumulate_into, std::int32_t tokens);
 
-    // Promotion: `packed` is one expert already in FlashNextExpertCache::pack()'s byte layout
-    // (packed_bytes() long: 256-aligned gate codes, gate scales, gate divisor, down codes, down
-    // scales, down divisor). Copies it into a staging buffer and starts an async upload into a
-    // free or LRU slot; poll retire_promotions() (checked at the start of the next call) to see
-    // it become resident. A no-op if no promotion buffer is free or every slot is in flight.
-    void begin_promotion(std::int64_t key, const std::byte* packed);
+    // Promotion of `key`, which the caller has seen miss `candidate_frequency` times recently.
+    // Picks a free slot, else the least frequently (then least recently) used one, and admits the
+    // candidate only if that victim's decayed hit count is below candidate_frequency, so experts
+    // used once do not displace the working set. On admission `fill` writes the expert in
+    // FlashNextExpertCache::pack()'s layout (packed_bytes()) straight into the staging buffer and
+    // an async upload starts; retire_promotions() (start of the next call) makes it resident.
+    // Returns false (fill not called) when rejected or no staging buffer / slot is free.
+    bool begin_promotion(std::int64_t key, std::uint32_t candidate_frequency,
+                         const std::function<void(std::byte*)>& fill);
+    // Forgets `key` (e.g. it was promoted to the CUDA cache); its slot becomes free.
+    void drop(std::int64_t key);
     void retire_promotions();
     [[nodiscard]] bool promotion_in_flight(std::int64_t key) const;
     [[nodiscard]] bool has_free_promotion_slot() const;
