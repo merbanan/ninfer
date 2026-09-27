@@ -10,7 +10,11 @@
 #include "targets/qwen3_8_flash_next/impl/program_impl.h"
 #include "targets/qwen3_8_flash_next/impl/runtime_plan.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <stdexcept>
 #include <utility>
@@ -109,6 +113,22 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     if (const char* env = std::getenv("NINFER_FLASH_NEXT_DRAFT_HEAD_ROWS"); env && env[0] != '\0') {
         draft_rows = static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10));
     }
+    // The BF16 output head and token embedding take 2.4 GiB of device memory; on cards below
+    // 24 GiB the sm_70 build (an 8 GB Turing card with the experts in host memory) stores both
+    // as FP8 rows instead (NINFER_FLASH_NEXT_BF16_HEAD=1 keeps BF16).
+    bool fp8_head      = options.quantize_output_head_fp8;
+    bool fp8_embedding = options.quantize_token_embedding_fp8;
+#if defined(NINFER_VOLTA_BUILD)
+    {
+        const char* keep = std::getenv("NINFER_FLASH_NEXT_BF16_HEAD");
+        std::size_t free_bytes = 0, total_bytes = 0;
+        if ((keep == nullptr || std::strcmp(keep, "1") != 0) &&
+            cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess && total_bytes < (24ULL << 30)) {
+            fp8_head      = true;
+            fp8_embedding = true;
+        }
+    }
+#endif
     // The quantize flags have to reach the binder, not just the materializer: they decide whether
     // the BF16 head/embedding is uploaded into the artifact arena or left in the file mapping.
     auto target_plan = detail::bind_artifact(
@@ -117,12 +137,11 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                     .mtp                          = enable_mtp,
                     .proposal_head                = options.speculative.proposal_head,
                     .draft_head_rows              = draft_rows,
-                    .quantize_output_head_fp8     = options.quantize_output_head_fp8,
-                    .quantize_token_embedding_fp8 = options.quantize_token_embedding_fp8,
+                    .quantize_output_head_fp8     = fp8_head,
+                    .quantize_token_embedding_fp8 = fp8_embedding,
                 });
-    return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile, std::move(target_plan), options.quantize_output_head_fp8,
-        options.quantize_token_embedding_fp8));
+    return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(target_plan), fp8_head,
+                                                     fp8_embedding));
 }
 
 std::unique_ptr<Package::LoadedModel>
