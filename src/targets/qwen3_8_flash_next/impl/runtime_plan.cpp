@@ -40,6 +40,11 @@ std::size_t checked_align_up_256(std::size_t bytes) {
 
 std::size_t flash_next_expert_staging_bytes() {
 #if defined(NINFER_VOLTA_BUILD)
+    // The expert cache (flash_next_expert_cache) runs prefill from its own slots; only the
+    // per-call staging path it replaces needs a compact 512-expert bank.
+    if (const char* value = std::getenv("NINFER_FLASH_NEXT_OFFLOAD"); value == nullptr || std::strcmp(value, "0") != 0) {
+        return 0;
+    }
     constexpr std::size_t kExpertSlots = 512;
     const auto nvfp4_bank_bytes = [](std::size_t slots, std::size_t rows, std::size_t columns) {
         const std::size_t elements = checked_mul<std::size_t>(checked_mul<std::size_t>(slots, rows), columns);

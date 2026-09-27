@@ -1,6 +1,6 @@
 // Flash-Next host-resident experts through the device expert cache against the same banks fully
 // device resident, on synthetic weights: decode calls with host-computed misses, promotions,
-// prefill staging, and cached hits after a prefill.
+// hybrid and uploading prefill, and cached hits after a prefill.
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/device.h"
@@ -100,7 +100,7 @@ int main() {
         std::printf("SKIP: no CUDA device\n");
         return 77;
     }
-    setenv("NINFER_FLASH_NEXT_CACHE_MB", "560", 0);
+    setenv("NINFER_FLASH_NEXT_CACHE_MB", "1500", 0);
     setenv("NINFER_FLASH_NEXT_ADMIT", "1", 0);
     setenv("NINFER_FLASH_NEXT_PROMOTE", "4", 0);
     setenv("NINFER_FLASH_NEXT_HYBRID", "48", 0);
@@ -135,8 +135,6 @@ int main() {
 
     constexpr int kMaxTokens = 64;
     DeviceArena workspace(flash_next_moe_workspace_capacity_bytes(1, kMaxTokens) + (1U << 20));
-    const std::size_t staging_bytes = ((gate.bytes.size() + 255U) & ~std::size_t{255U}) + down.bytes.size();
-    DeviceBuffer staging(staging_bytes);
     DeviceArena io((static_cast<std::size_t>(kHidden) * kMaxTokens * 2 + 4096) * 3);
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -150,7 +148,7 @@ int main() {
         Tensor cached    = io.alloc(DType::BF16, {kHidden, tokens});
         CUDA_CHECK(cudaMemcpy(input.data, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
         flash_next_moe(input, device_weights, reference, workspace, stream);
-        flash_next_moe(input, host_weights, cached, workspace, stream, staging.p, staging.bytes);
+        flash_next_moe(input, host_weights, cached, workspace, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         std::vector<std::uint16_t> a(x.size()), b(x.size());
         CUDA_CHECK(cudaMemcpy(a.data(), reference.data, a.size() * 2, cudaMemcpyDeviceToHost));
@@ -167,11 +165,10 @@ int main() {
         const auto& st = flash_next_expert_cache()->stats();
         const bool ok  = std::isfinite(max_err) && max_ref > 0.0 && (exact ? differ == 0 : max_err <= 2e-2 * max_ref);
         std::printf("%-26s T=%-3d max|ref| %.4g max err %.3g differing %zu | hits %llu/%llu cold %llu promo %llu "
-                    "uploads %llu inserted %llu hybrid %llu %s\n",
+                    "uploads %llu hybrid %llu %s\n",
                     label, tokens, max_ref, max_err, differ, static_cast<unsigned long long>(st.hits),
                     static_cast<unsigned long long>(st.lookups), static_cast<unsigned long long>(st.cold),
                     static_cast<unsigned long long>(st.promotions), static_cast<unsigned long long>(st.uploads),
-                    static_cast<unsigned long long>(st.inserted),
                     static_cast<unsigned long long>(st.hybrid_calls), ok ? "ok" : "FAIL");
         failures += ok ? 0 : 1;
     };
@@ -200,6 +197,7 @@ int main() {
     // Large prefill: every missing expert uploaded (above the hybrid bound), then kept cached.
     const auto x64 = random_x(64);
     run(x64, 64, "prefill (uploads)", true);
+    run(x64, 64, "prefill again (cached)", true);
     flash_next_expert_cache()->report();
     std::printf(failures == 0 ? "PASS\n" : "FAIL\n");
     return failures == 0 ? 0 : 1;

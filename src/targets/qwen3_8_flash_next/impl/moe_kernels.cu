@@ -538,6 +538,7 @@ __global__ __launch_bounds__(256, 4) void flash_next_moe_prefill_gate_up_kernel(
     const float* __restrict__ expert_divisors,
     std::uint64_t code_stride,
     std::uint64_t scale_stride,
+    const std::int32_t* __restrict__ expert_slots,
     __nv_bfloat16* __restrict__ activations) {
     const int total_active = active_count_ptr[0];
     const int tid          = static_cast<int>(threadIdx.x);
@@ -558,9 +559,10 @@ __global__ __launch_bounds__(256, 4) void flash_next_moe_prefill_gate_up_kernel(
 
         const int start_idx = expert_offsets[expert];
 
-        const auto* codes_base  = expert_codes + static_cast<std::uint64_t>(expert) * code_stride;
-        const auto* scales_base = expert_scales + static_cast<std::uint64_t>(expert) * scale_stride;
-        const float inv_divisor = 1.0F / expert_divisors[expert];
+        const int bank          = expert_slots != nullptr ? expert_slots[expert] : expert;
+        const auto* codes_base  = expert_codes + static_cast<std::uint64_t>(bank) * code_stride;
+        const auto* scales_base = expert_scales + static_cast<std::uint64_t>(bank) * scale_stride;
+        const float inv_divisor = 1.0F / expert_divisors[bank];
 
         // 1. Cooperative coalesced scale staging for 16 rows x 40 tiles = 640 tasks
         for (int task = tid; task < 640; task += 256) {
@@ -1222,6 +1224,7 @@ __global__ __launch_bounds__(256, 4) void flash_next_moe_prefill_down_kernel(
     const float* __restrict__ expert_divisors,
     std::uint64_t code_stride,
     std::uint64_t scale_stride,
+    const std::int32_t* __restrict__ expert_slots,
     float* __restrict__ down_intermediate) {
     const int total_active = active_count_ptr[0];
     const int tid          = static_cast<int>(threadIdx.x);
@@ -1242,9 +1245,10 @@ __global__ __launch_bounds__(256, 4) void flash_next_moe_prefill_down_kernel(
 
         const int start_idx = expert_offsets[expert];
 
-        const auto* codes_base  = expert_codes + static_cast<std::uint64_t>(expert) * code_stride;
-        const auto* scales_base = expert_scales + static_cast<std::uint64_t>(expert) * scale_stride;
-        const float inv_divisor = 1.0F / expert_divisors[expert];
+        const int bank          = expert_slots != nullptr ? expert_slots[expert] : expert;
+        const auto* codes_base  = expert_codes + static_cast<std::uint64_t>(bank) * code_stride;
+        const auto* scales_base = expert_scales + static_cast<std::uint64_t>(bank) * scale_stride;
+        const float inv_divisor = 1.0F / expert_divisors[bank];
 
         // 1. Cooperative coalesced scale staging for 16 rows x 10 tiles = 160 tasks
         for (int task = tid; task < 160; task += 256) {
@@ -1965,6 +1969,9 @@ void flash_next_moe_kernels_launch(const Tensor& input, const MoeWeights& weight
 #else
             tokens >= kFlashNextMoeMmaPrefillThreshold;
 #endif
+        if (use_native_mma_prefill && workspace.expert_slots != nullptr) {
+            throw std::invalid_argument("Flash-Next MoE: expert slot tables need the SIMT prefill kernels");
+        }
         if (use_native_mma_prefill) {
             // Large tokens: Native NVFP4 Tensor Core MMA route
             // 2. Shared expert gate & up. Completely disjoint from routed MMA.
@@ -2148,6 +2155,7 @@ void flash_next_moe_kernels_launch(const Tensor& input, const MoeWeights& weight
                 weights.expert_gate_up.weight_scale_divisors,
                 weights.expert_gate_up.code_bytes_per_expert,
                 weights.expert_gate_up.scale_bytes_per_expert,
+                workspace.expert_slots,
                 static_cast<__nv_bfloat16*>(workspace.activations.data));
             CUDA_CHECK(cudaGetLastError());
             stage_ledger_record(stream, FlashNextStageId::MoE_RoutedGateUp);
@@ -2185,6 +2193,7 @@ void flash_next_moe_kernels_launch(const Tensor& input, const MoeWeights& weight
                 weights.expert_down.weight_scale_divisors,
                 weights.expert_down.code_bytes_per_expert,
                 weights.expert_down.scale_bytes_per_expert,
+                workspace.expert_slots,
                 static_cast<float*>(workspace.down_intermediate.data));
             CUDA_CHECK(cudaGetLastError());
             stage_ledger_record(stream, FlashNextStageId::MoE_RoutedDown);

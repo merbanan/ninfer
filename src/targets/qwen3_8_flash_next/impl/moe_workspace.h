@@ -36,6 +36,9 @@ struct FlashNextMoeWorkspace {
     // Decode arm only: FP32 [2560, T] routed-expert sum computed on the host for experts the
     // offload cache does not hold (their ids point at an all-zero slot); added before rounding.
     const float* cold_sum = nullptr;
+    // Prefill arm, SIMT kernels only: bank index of each routed id [512] (device), so routed ids
+    // stay < 512 for grouping while the weights come from any slot of a larger bank.
+    const std::int32_t* expert_slots = nullptr;
 };
 
 template <class Arena>

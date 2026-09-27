@@ -112,7 +112,7 @@ void flash_next_moe(const Tensor& input, const MoeWeights& weights, Tensor& outp
     }
     if (weights.expert_gate_up.mapped_host) {
         if (auto* cache = flash_next_expert_cache(); cache != nullptr) {
-            cache->run(input, weights, scratch, output, stream, expert_staging, expert_staging_bytes);
+            cache->run(input, weights, scratch, output, stream);
             return;
         }
         std::vector<std::int32_t> host_ids(static_cast<std::size_t>(tokens) * 10);

@@ -30,8 +30,6 @@ struct FlashNextOffloadPolicy {
     // missed `admit_misses` times (halved every 64 decode calls of a layer).
     std::uint32_t promotions_per_call = 1;
     std::uint32_t admit_misses        = 4;
-    // Prefill-uploaded experts enter the cache (least recently used slots are replaced).
-    bool cache_prefill_experts = true;
     // Prefill-size calls of at most this many tokens split their missing experts between the
     // host and uploads by estimated cost (0 disables): an upload costs expert bytes / upload_gbps
     // on the bus plus pack_us_per_expert of host copying, a host expert host_us_per_expert plus
@@ -47,7 +45,7 @@ struct FlashNextOffloadPolicy {
     bool report                = false;
 
     // NINFER_FLASH_NEXT_CACHE_MB, NINFER_FLASH_NEXT_CACHE_RESERVE_MB, NINFER_FLASH_NEXT_HOST_TOKENS,
-    // NINFER_FLASH_NEXT_PROMOTE, NINFER_FLASH_NEXT_ADMIT, NINFER_FLASH_NEXT_CACHE_PREFILL,
+    // NINFER_FLASH_NEXT_PROMOTE, NINFER_FLASH_NEXT_ADMIT,
     // NINFER_FLASH_NEXT_CPU_THREADS, NINFER_FLASH_NEXT_HYBRID, NINFER_FLASH_NEXT_HOST_US
     // ("<per expert>,<per column>"), NINFER_FLASH_NEXT_OFFLOAD_STATS.
     [[nodiscard]] static FlashNextOffloadPolicy from_environment();
@@ -58,9 +56,8 @@ struct FlashNextOffloadStats {
     std::uint64_t lookups      = 0; // distinct (call, expert) pairs
     std::uint64_t hits         = 0;
     std::uint64_t cold         = 0; // computed on the host
-    std::uint64_t uploads      = 0; // uploaded before use
+    std::uint64_t uploads      = 0; // uploaded before use (prefill-size calls)
     std::uint64_t promotions   = 0; // uploaded in the background
-    std::uint64_t inserted     = 0; // prefill uploads kept in the cache
     std::uint64_t hybrid_calls = 0; // prefill calls that sent experts to the host
     double host_seconds        = 0.0;
     double upload_seconds      = 0.0;
@@ -74,9 +71,9 @@ struct FlashNextOffloadStats {
 // Decode-size calls run cached experts on the device and send the misses to the zero expert,
 // computing them on the host into an FP32 addend the down kernel adds; a few misses are then
 // uploaded in the background (copy stream) so the cache follows the routing. Prefill-size calls
-// assemble their active experts in the runtime's compact staging banks (device copies of cached
-// ones, uploads of the rest) and remap the routed ids to staging indices, which keeps the
-// grouped prefill kernels unchanged.
+// upload their missing experts into least recently used slots (or, for experts few tokens
+// selected, compute them on the host) and run the grouped kernels on the cache banks through a
+// per-call expert -> slot table.
 class FlashNextExpertCache {
 public:
     explicit FlashNextExpertCache(FlashNextOffloadPolicy policy = FlashNextOffloadPolicy::from_environment());
@@ -87,7 +84,7 @@ public:
 
     // The routed part of flash_next_moe after routing: scratch holds ids/alpha/shared_scale.
     void run(const Tensor& input, const MoeWeights& weights, FlashNextMoeWorkspace& scratch, Tensor& output,
-             cudaStream_t stream, void* staging, std::size_t staging_bytes);
+             cudaStream_t stream);
 
     [[nodiscard]] const FlashNextOffloadStats& stats() const noexcept { return stats_; }
     [[nodiscard]] const FlashNextOffloadPolicy& policy() const noexcept { return policy_; }
@@ -117,7 +114,7 @@ private:
     void decode(int layer, const Tensor& input, const MoeWeights& weights, FlashNextMoeWorkspace& scratch,
                 Tensor& output, cudaStream_t stream);
     void prefill(int layer, const Tensor& input, const MoeWeights& weights, FlashNextMoeWorkspace& scratch,
-                 Tensor& output, cudaStream_t stream, void* staging, std::size_t staging_bytes);
+                 Tensor& output, cudaStream_t stream);
     void retire_promotions();
     [[nodiscard]] std::int64_t victim() const;
     // Copies `experts` of both host banks into `dst`, packed_bytes() apart (gate codes, scales,
@@ -129,11 +126,6 @@ private:
     // Six copies of one packed expert into expert `index` of the banks at gate_base/down_base.
     void unpack(const std::byte* src, std::byte* gate_base, std::byte* down_base, std::int64_t index,
                 cudaMemcpyKind kind, cudaStream_t stream) const;
-    // Copies expert `from` of banks (src_gate, src_down) to expert `to` of (dst_gate, dst_down).
-    void copy_expert(const std::byte* src_gate, const std::byte* src_down, const Bank& src_gb,
-                     const Bank& src_db, std::int64_t from, std::byte* dst_gate, std::byte* dst_down,
-                     const Bank& dst_gb, const Bank& dst_db, std::int64_t to, cudaStream_t stream) const;
-
     FlashNextOffloadPolicy policy_;
     bool allocated_ = false;
     std::uint32_t slots_ = 0;
@@ -155,6 +147,8 @@ private:
     DeviceBuffer device_cold_{sizeof(float) * 2560 * 8};
     std::unique_ptr<PinnedHostBuffer> prefill_ids_, prefill_x_, prefill_alpha_, prefill_cold_;
     DeviceBuffer prefill_cold_device_;
+    PinnedHostBuffer host_slots_{sizeof(std::int32_t) * 512};
+    DeviceBuffer device_slots_{sizeof(std::int32_t) * 512};
 
     // Prefill uploads: batches of packed experts in two alternating pinned buffers.
     static constexpr std::size_t kBatchExperts = 8;
