@@ -1,3 +1,9 @@
+# The RX 570 (Vulkan) decode-time expert tier: an extra, smaller expert cache on the machine's
+# second GPU, between the CUDA cache and the CPU host path. Off by default: needs Vulkan headers
+# and glslangValidator (the ninfer-sm70-vk derived image; see handoff.md), not part of the base
+# ninfer-sm70-dev toolchain.
+option(NINFER_VULKAN_EXPERTS "Flash-Next: enable the RX 570 Vulkan expert tier" OFF)
+
 add_library(ninfer_qwen3_8_flash_next STATIC
   impl/expert_bank.cpp
   impl/expert_cache.cpp
@@ -44,6 +50,18 @@ target_include_directories(ninfer_qwen3_8_flash_next PUBLIC
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_qwen3_8_flash_next PUBLIC ninfer_artifact ninfer_ops ninfer_qwen3_vision ninfer_core)
 ninfer_cuda_archive(ninfer_qwen3_8_flash_next)
+
+if(NINFER_VULKAN_EXPERTS)
+  find_package(Vulkan REQUIRED)
+  include(${PROJECT_SOURCE_DIR}/cmake/EmbedSpirv.cmake)
+  set(flash_next_vk_spirv_headers)
+  ninfer_embed_spirv_shader(flash_next_vk_spirv_headers impl/vk/gate_up.comp gate_up)
+  ninfer_embed_spirv_shader(flash_next_vk_spirv_headers impl/vk/down.comp down)
+  target_sources(ninfer_qwen3_8_flash_next PRIVATE impl/vk/vk_experts.cpp ${flash_next_vk_spirv_headers})
+  target_include_directories(ninfer_qwen3_8_flash_next PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+  target_compile_definitions(ninfer_qwen3_8_flash_next PUBLIC NINFER_FLASH_NEXT_VULKAN=1)
+  target_link_libraries(ninfer_qwen3_8_flash_next PUBLIC Vulkan::Vulkan)
+endif()
 
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   target_compile_definitions(ninfer_qwen3_8_flash_next PRIVATE NINFER_VOLTA_BUILD=1)

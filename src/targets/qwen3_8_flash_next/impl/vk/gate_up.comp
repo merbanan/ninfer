@@ -1,0 +1,130 @@
+#version 450
+
+// Flash-Next RX 570 expert tier, gate/up stage. One workgroup per (job slot in the call's fixed
+// kMaxJobs-wide job table, 64-row block of the 640 gate/up output pairs); one thread per row. A
+// job with fewer tokens or an unused job slot (count == 0) just does less/no work: the dispatch
+// grid is always (kMaxJobs, kRowBlocks, 1), so the host never has to compute it per call.
+//
+// Math mirrors expert_cpu.cpp's flash_next_cold_experts exactly: FP32 accumulation, exact NVFP4
+// decode (E2M1 magnitude table + E4M3 formula, no native FP16/FP4 hardware on Polaris), SiLU(g)*u
+// rounded to BF16 (materialized here as its FP32 value, matching the device kernels' stored
+// activation) before the down stage.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const uint kHidden       = 2560u;
+const uint kIntermediate = 640u;
+const uint kGroup        = 16u;  // columns per E4M3 scale
+const uint kRowBlock      = 64u;
+const uint kMaxJobs       = 10u; // == kTopK in expert_cache.cpp: at most this many distinct
+                                  // experts per decode call
+const uint kMaxTokens     = 8u;  // == FlashNextOffloadPolicy::host_max_tokens ceiling
+
+// Packed-slot byte layout (FlashNextExpertCache::packed_bytes()/pack()): gate codes, gate scales,
+// gate divisor, down codes, down scales, down divisor, each 256-byte aligned. Sizes depend only on
+// the bank geometry (fixed for this target) but are passed as spec constants so the one formula in
+// vk_experts.cpp is the single source of truth for both the buffer layout and the host packer.
+layout(constant_id = 0) const uint kGateCodeWords  = 1u;
+layout(constant_id = 1) const uint kGateScaleWords = 1u;
+layout(constant_id = 2) const uint kDownCodeWords  = 1u;
+layout(constant_id = 3) const uint kDownScaleWords = 1u;
+
+uint align_words(uint w) { return (w + 63u) & ~63u; } // 256 bytes = 64 words
+
+uint gate_codes_word0()  { return 0u; }
+uint gate_scales_word0() { return align_words(kGateCodeWords); }
+uint gate_div_word0()    { return gate_scales_word0() + align_words(kGateScaleWords); }
+uint packed_words()      { return gate_div_word0() + 64u + align_words(kDownCodeWords) + align_words(kDownScaleWords) + 64u; }
+
+layout(std430, set = 0, binding = 0) readonly buffer SlotPool { uint data[]; } slot_pool;
+layout(std430, set = 0, binding = 1) readonly buffer XBuf { float x[]; } xbuf;
+layout(std430, set = 0, binding = 2) readonly buffer JobsBuf { uint data[]; } jobs_buf;
+layout(std430, set = 0, binding = 3) writeonly buffer ActBuf { float act[]; } act_buf;
+
+// Job table: kMaxTokens=8 tokens/weights per job, packed as flat uint words (not a GLSL struct
+// array, whose std430 stride the host side would have to reproduce exactly): per job, 18 words =
+// slot, count, tokens[8], weights[8] (weights bit-cast float -> uint).
+const uint kJobWords = 2u + 2u * kMaxTokens;
+uint job_slot(uint j) { return jobs_buf.data[j * kJobWords + 0u]; }
+uint job_count(uint j) { return jobs_buf.data[j * kJobWords + 1u]; }
+uint job_token(uint j, uint k) { return jobs_buf.data[j * kJobWords + 2u + k]; }
+float job_weight(uint j, uint k) { return uintBitsToFloat(jobs_buf.data[j * kJobWords + 2u + kMaxTokens + k]); }
+
+float e2m1_decode(uint nibble) {
+    const float mag[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float m = mag[nibble & 7u];
+    return (nibble & 8u) != 0u ? -m : m;
+}
+
+float e4m3_decode(uint bits) {
+    uint sign     = (bits >> 7) & 1u;
+    uint exponent = (bits >> 3) & 0xFu;
+    uint mantissa = bits & 0x7u;
+    float value;
+    if (exponent == 0u) {
+        value = (float(mantissa) / 8.0) * exp2(-6.0);
+    } else {
+        value = (1.0 + float(mantissa) / 8.0) * exp2(float(exponent) - 7.0);
+    }
+    return sign != 0u ? -value : value;
+}
+
+// Byte offset -> (word index, byte lane) helper.
+uint byte_from_word(uint word, uint lane) { return (word >> (lane * 8u)) & 0xFFu; }
+
+// Swizzled E4M3 scale offset, in bytes from the start of the matrix's own scale plane
+// (storage-layouts.md section 4; matches expert_cpu.cpp's scale_offset()).
+uint scale_offset(uint row, uint group, uint columns) {
+    uint k_tiles    = columns / 64u;
+    uint row_tile   = row / 128u;
+    uint row_inner  = row % 128u;
+    uint scale_tile = group / 4u;
+    uint scale_lane = group % 4u;
+    return (row_tile * k_tiles + scale_tile) * 512u + (row_inner % 32u) * 16u + (row_inner / 32u) * 4u + scale_lane;
+}
+
+// Dot product of gate/up matrix row `row` (of the 1280-row gate/up matrix, columns = kHidden) with
+// x column `xoff` (a kHidden-long FP32 vector at xbuf.x[xoff..xoff+kHidden)), for the slot at
+// `slot_base` (word index of the packed blob's start).
+float row_dot(uint slot_base, uint row, uint xoff) {
+    float acc = 0.0;
+    uint code_row_word0  = slot_base + gate_codes_word0() + row * (kHidden / 2u / 4u);
+    uint groups          = kHidden / kGroup;
+    for (uint g = 0u; g < groups; ++g) {
+        uint scale_byte = scale_offset(row, g, kHidden);
+        uint scale_word = slot_base + gate_scales_word0() + scale_byte / 4u;
+        float scale      = e4m3_decode(byte_from_word(slot_pool.data[scale_word], scale_byte & 3u));
+        uint byte_base   = g * 8u; // 8 bytes = 16 nibbles per group, word-aligned (kGroup/2 == 8)
+        uint w0           = slot_pool.data[code_row_word0 + byte_base / 4u];
+        uint w1           = slot_pool.data[code_row_word0 + byte_base / 4u + 1u];
+        uint xk           = xoff + g * kGroup;
+        for (uint b = 0u; b < 4u; ++b) {
+            uint byte0 = byte_from_word(w0, b);
+            acc += e2m1_decode(byte0 & 0xFu) * scale * xbuf.x[xk + b * 2u];
+            acc += e2m1_decode(byte0 >> 4u) * scale * xbuf.x[xk + b * 2u + 1u];
+        }
+        for (uint b = 0u; b < 4u; ++b) {
+            uint byte1 = byte_from_word(w1, b);
+            acc += e2m1_decode(byte1 & 0xFu) * scale * xbuf.x[xk + 8u + b * 2u];
+            acc += e2m1_decode(byte1 >> 4u) * scale * xbuf.x[xk + 8u + b * 2u + 1u];
+        }
+    }
+    float div_word = uintBitsToFloat(slot_pool.data[slot_base + gate_div_word0()]);
+    return acc / div_word;
+}
+
+void main() {
+    uint job_index = gl_WorkGroupID.x;
+    uint pair_row  = gl_WorkGroupID.y * kRowBlock + gl_LocalInvocationID.x;
+    uint count     = job_count(job_index);
+    if (count == 0u) { return; }
+
+    uint slot_base = job_slot(job_index) * packed_words();
+    for (uint k = 0u; k < count; ++k) {
+        uint xoff = job_token(job_index, k) * kHidden;
+        float g   = row_dot(slot_base, pair_row, xoff);
+        float u   = row_dot(slot_base, kIntermediate + pair_row, xoff);
+        float silu = g / (1.0 + exp(-g));
+        act_buf.act[(job_index * kMaxTokens + k) * kIntermediate + pair_row] = silu * u;
+    }
+}

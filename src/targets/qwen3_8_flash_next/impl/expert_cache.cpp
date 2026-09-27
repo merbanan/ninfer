@@ -91,6 +91,9 @@ void FlashNextExpertCache::report() const {
                  static_cast<unsigned long long>(stats_.cold), static_cast<unsigned long long>(stats_.uploads),
                  static_cast<unsigned long long>(stats_.promotions),
                  static_cast<unsigned long long>(stats_.hybrid_calls), stats_.host_seconds, stats_.upload_seconds);
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+    if (vk_) { vk_->report(); }
+#endif
 }
 
 FlashNextExpertCache::~FlashNextExpertCache() {
@@ -171,6 +174,9 @@ void FlashNextExpertCache::allocate(const MoeWeights& weights) {
                  "<= %d tokens, %u host threads\n",
                  slots_, static_cast<double>(gate_.total + down_.total) / (1U << 30), policy_.host_max_tokens,
                  policy_.host_threads);
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+    vk_ = FlashNextVkExperts::create(weights, FlashNextVkPolicy::from_environment());
+#endif
 }
 
 int FlashNextExpertCache::layer_of(const MoeWeights& weights) {
@@ -323,12 +329,22 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     retire_promotions();
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+    if (vk_) { vk_->retire_promotions(); }
+#endif
 
-    // Distinct experts of the call, with their routed (column, weight) pairs.
+    // Distinct experts of the call, with their routed (column, weight) pairs. Non-CUDA-resident
+    // experts go to the RX 570 tier when it holds them, else the CPU.
     std::array<std::int32_t, kExperts> index_of;
     index_of.fill(-1);
     std::vector<FlashNextColdExpert> cold;
-    std::vector<std::int32_t> slot_of_expert;
+    std::vector<std::int32_t> cold_expert_id; // parallel to `cold`
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+    std::vector<FlashNextVkJob> vk_jobs;
+#endif
+    std::vector<std::int32_t> slot_of_expert; // >=0: CUDA slot; -1: goes to the RX 570 tier or the CPU
+    std::vector<std::uint8_t> is_vk;          // parallel to `experts`; meaningful only when slot < 0
+    std::vector<std::int32_t> cold_or_vk_index; // parallel to `experts`; index into cold[] or vk_jobs[]
     std::vector<std::int32_t> experts;
     for (std::size_t i = 0; i < n; ++i) {
         const std::int32_t e = ids[i];
@@ -340,35 +356,55 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
         const auto it          = resident_.find(key);
         if (it != resident_.end()) {
             slot_of_expert.push_back(static_cast<std::int32_t>(it->second));
+            is_vk.push_back(0);
+            cold_or_vk_index.push_back(-1);
             slot_[it->second].last_used = clock_;
             needed_[it->second]         = 1;
-        } else {
-            slot_of_expert.push_back(-1 - static_cast<std::int32_t>(cold.size()));
-            FlashNextColdExpert work;
-            work.gate_up = host_matrix(weights.expert_gate_up, e);
-            work.down    = host_matrix(weights.expert_down, e);
-            cold.push_back(std::move(work));
+            continue;
         }
+        slot_of_expert.push_back(-1);
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+        if (vk_ && vk_->resident(key)) {
+            is_vk.push_back(1);
+            cold_or_vk_index.push_back(static_cast<std::int32_t>(vk_jobs.size()));
+            vk_jobs.push_back(FlashNextVkJob{vk_->slot_of(key), {}, {}});
+            continue;
+        }
+#endif
+        is_vk.push_back(0);
+        cold_or_vk_index.push_back(static_cast<std::int32_t>(cold.size()));
+        FlashNextColdExpert work;
+        work.gate_up = host_matrix(weights.expert_gate_up, e);
+        work.down    = host_matrix(weights.expert_down, e);
+        cold.push_back(std::move(work));
+        cold_expert_id.push_back(e);
     }
     stats_.lookups += experts.size();
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+    stats_.hits += experts.size() - cold.size() - vk_jobs.size();
+#else
     stats_.hits += experts.size() - cold.size();
+#endif
     stats_.cold += cold.size();
     for (std::size_t i = 0; i < n; ++i) {
-        const std::int32_t slot = slot_of_expert[static_cast<std::size_t>(index_of[ids[i]])];
+        const std::int32_t pos  = index_of[ids[i]];
+        const std::int32_t slot = slot_of_expert[static_cast<std::size_t>(pos)];
         if (slot < 0) {
-            auto& work = cold[static_cast<std::size_t>(-1 - slot)];
-            work.columns.push_back(static_cast<std::int32_t>(i / kTopK));
-            work.weights.push_back(alpha[i]);
+            const auto idx = static_cast<std::size_t>(cold_or_vk_index[static_cast<std::size_t>(pos)]);
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+            if (is_vk[static_cast<std::size_t>(pos)] != 0) {
+                vk_jobs[idx].columns.push_back(static_cast<std::int32_t>(i / kTopK));
+                vk_jobs[idx].weights.push_back(alpha[i]);
+            } else
+#endif
+            {
+                cold[idx].columns.push_back(static_cast<std::int32_t>(i / kTopK));
+                cold[idx].weights.push_back(alpha[i]);
+            }
         }
         ids[i] = slot >= 0 ? slot : static_cast<std::int32_t>(slots_);
     }
-    if (!cold.empty()) {
-        std::vector<std::int32_t> cold_experts;
-        for (std::size_t i = 0; i < experts.size(); ++i) {
-            if (slot_of_expert[i] < 0) { cold_experts.push_back(experts[i]); }
-        }
-        will_need(weights, cold_experts);
-    }
+    if (!cold.empty()) { will_need(weights, cold_expert_id); }
     CUDA_CHECK(cudaMemcpyAsync(scratch.ids.data, ids, n * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
     MoeWeights cached     = weights;
     cached.expert_gate_up = make_nvfp4_expert_bank_view(gate_pool_.p, gate_.total, static_cast<std::int32_t>(slots_ + 1),
@@ -379,15 +415,32 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
     // then adds their sum before rounding.
     flash_next_moe_gate_up_decode_launch(input, cached, scratch, tokens, stream);
     scratch.cold_sum = nullptr;
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+    const bool have_vk_jobs = vk_ && !vk_jobs.empty();
+    if (have_vk_jobs) { vk_->submit(vk_jobs, x, tokens); }
+#endif
     if (!cold.empty()) {
         const auto start = std::chrono::steady_clock::now();
         auto* sum        = static_cast<float*>(host_cold_.data());
         flash_next_cold_experts(cold, x, tokens, sum, *cpu_pool_);
         stats_.host_seconds += seconds_since(start);
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+        if (have_vk_jobs) { vk_->wait(sum, tokens); }
+#endif
         CUDA_CHECK(cudaMemcpyAsync(device_cold_.p, sum, static_cast<std::size_t>(tokens) * kHidden * sizeof(float),
                                    cudaMemcpyHostToDevice, stream));
         scratch.cold_sum = static_cast<const float*>(device_cold_.p);
     }
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+    else if (have_vk_jobs) {
+        auto* sum = static_cast<float*>(host_cold_.data());
+        std::memset(sum, 0, static_cast<std::size_t>(tokens) * kHidden * sizeof(float));
+        vk_->wait(sum, tokens);
+        CUDA_CHECK(cudaMemcpyAsync(device_cold_.p, sum, static_cast<std::size_t>(tokens) * kHidden * sizeof(float),
+                                   cudaMemcpyHostToDevice, stream));
+        scratch.cold_sum = static_cast<const float*>(device_cold_.p);
+    }
+#endif
     flash_next_moe_down_launch(flash_next_moe_down_kernel_selection(), cached, scratch, tokens, output, stream);
     scratch.cold_sum = nullptr;
 
@@ -440,6 +493,31 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
             ++issued;
         }
     }
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+    // RX 570 promotions: among the experts this call actually computed on the CPU (not the ones
+    // already RX 570-resident), the most CUDA-missed go to a free/LRU Vulkan slot. Reuses the same
+    // miss counters as the CUDA promotions above; not reset here, so a Vulkan-resident expert can
+    // still graduate to the (faster) CUDA cache later.
+    if (vk_ && !cold.empty()) {
+        std::vector<std::pair<std::uint16_t, std::int32_t>> vk_candidates; // (misses, expert)
+        for (const std::int32_t e : cold_expert_id) {
+            const auto misses = miss_counts_[static_cast<std::size_t>(layer) * kExperts + e];
+            if (misses >= policy_.admit_misses) { vk_candidates.emplace_back(misses, e); }
+        }
+        std::sort(vk_candidates.begin(), vk_candidates.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::uint32_t issued = 0;
+        std::vector<std::byte> packed(vk_->packed_bytes());
+        for (const auto& [misses, e] : vk_candidates) {
+            if (issued >= vk_->policy().promote_per_call || !vk_->has_free_promotion_slot()) { break; }
+            const std::int64_t key = static_cast<std::int64_t>(layer) * kExperts + e;
+            if (vk_->resident(key) || vk_->promotion_in_flight(key)) { continue; }
+            pack(weights, std::span<const std::int32_t>(&e, 1), packed.data());
+            vk_->begin_promotion(key, packed.data());
+            ++issued;
+        }
+    }
+#endif
     if (++layer_calls_[static_cast<std::size_t>(layer)] % 64 == 0) {
         for (int e = 0; e < kExperts; ++e) { miss_counts_[static_cast<std::size_t>(layer) * kExperts + e] /= 2; }
     }

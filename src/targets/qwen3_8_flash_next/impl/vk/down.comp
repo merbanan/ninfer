@@ -1,0 +1,120 @@
+#version 450
+
+// Flash-Next RX 570 expert tier, down stage. One workgroup per 64 output rows of the 2560-row
+// down projection; one thread per row. Each thread loops over the call's fixed kMaxJobs-wide job
+// table itself (in ascending job order, deterministically: no atomics, this workgroup owns every
+// token/row pair it writes) and, within a job, its listed tokens, accumulating
+// alpha * down(act) into the output addend. An unused job slot (count == 0) contributes nothing.
+//
+// Math mirrors expert_cpu.cpp's flash_next_cold_experts down stage exactly: FP32 accumulation,
+// exact NVFP4 decode of the down matrix (E2M1 + E4M3, no native FP16/FP4 hardware on Polaris).
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const uint kHidden       = 2560u;
+const uint kIntermediate = 640u;
+const uint kGroup        = 16u;
+const uint kRowBlock     = 64u;
+const uint kMaxJobs      = 10u;
+const uint kMaxTokens    = 8u;
+
+layout(constant_id = 0) const uint kGateCodeWords  = 1u;
+layout(constant_id = 1) const uint kGateScaleWords = 1u;
+layout(constant_id = 2) const uint kDownCodeWords  = 1u;
+layout(constant_id = 3) const uint kDownScaleWords = 1u;
+
+uint align_words(uint w) { return (w + 63u) & ~63u; }
+
+uint gate_scales_word0() { return align_words(kGateCodeWords); }
+uint gate_div_word0()    { return gate_scales_word0() + align_words(kGateScaleWords); }
+uint down_codes_word0()  { return gate_div_word0() + 64u; }
+uint down_scales_word0() { return down_codes_word0() + align_words(kDownCodeWords); }
+uint down_div_word0()    { return down_scales_word0() + align_words(kDownScaleWords); }
+uint packed_words()      { return down_div_word0() + 64u; }
+
+layout(std430, set = 0, binding = 0) readonly buffer SlotPool { uint data[]; } slot_pool;
+layout(std430, set = 0, binding = 2) readonly buffer JobsBuf { uint data[]; } jobs_buf;
+layout(std430, set = 0, binding = 3) readonly buffer ActBuf { float act[]; } act_buf;
+layout(std430, set = 0, binding = 4) buffer OutBuf { float out_data[]; } outbuf;
+
+// Job table layout: see gate_up.comp (must match byte-for-byte; both are compiled from the same
+// GpuJob layout in vk_experts.cpp).
+const uint kJobWords = 2u + 2u * kMaxTokens;
+uint job_slot(uint j) { return jobs_buf.data[j * kJobWords + 0u]; }
+uint job_count(uint j) { return jobs_buf.data[j * kJobWords + 1u]; }
+uint job_token(uint j, uint k) { return jobs_buf.data[j * kJobWords + 2u + k]; }
+float job_weight(uint j, uint k) { return uintBitsToFloat(jobs_buf.data[j * kJobWords + 2u + kMaxTokens + k]); }
+
+float e2m1_decode(uint nibble) {
+    const float mag[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float m = mag[nibble & 7u];
+    return (nibble & 8u) != 0u ? -m : m;
+}
+
+float e4m3_decode(uint bits) {
+    uint sign     = (bits >> 7) & 1u;
+    uint exponent = (bits >> 3) & 0xFu;
+    uint mantissa = bits & 0x7u;
+    float value;
+    if (exponent == 0u) {
+        value = (float(mantissa) / 8.0) * exp2(-6.0);
+    } else {
+        value = (1.0 + float(mantissa) / 8.0) * exp2(float(exponent) - 7.0);
+    }
+    return sign != 0u ? -value : value;
+}
+
+uint byte_from_word(uint word, uint lane) { return (word >> (lane * 8u)) & 0xFFu; }
+
+uint scale_offset(uint row, uint group, uint columns) {
+    uint k_tiles    = columns / 64u;
+    uint row_tile   = row / 128u;
+    uint row_inner  = row % 128u;
+    uint scale_tile = group / 4u;
+    uint scale_lane = group % 4u;
+    return (row_tile * k_tiles + scale_tile) * 512u + (row_inner % 32u) * 16u + (row_inner / 32u) * 4u + scale_lane;
+}
+
+// Dot product of down-matrix row `row` (2560-row, kIntermediate-column matrix) with the
+// kIntermediate-long activation at act_buf.act[act_off..act_off+kIntermediate).
+float down_row_dot(uint slot_base, uint row, uint act_off) {
+    float acc = 0.0;
+    uint code_row_word0 = slot_base + down_codes_word0() + row * (kIntermediate / 2u / 4u);
+    uint groups         = kIntermediate / kGroup;
+    for (uint g = 0u; g < groups; ++g) {
+        uint scale_byte  = scale_offset(row, g, kIntermediate);
+        uint scale_word  = slot_base + down_scales_word0() + scale_byte / 4u;
+        float scale       = e4m3_decode(byte_from_word(slot_pool.data[scale_word], scale_byte & 3u));
+        uint byte_base    = g * 8u;
+        uint w0           = slot_pool.data[code_row_word0 + byte_base / 4u];
+        uint w1           = slot_pool.data[code_row_word0 + byte_base / 4u + 1u];
+        uint ak           = act_off + g * kGroup;
+        for (uint b = 0u; b < 4u; ++b) {
+            uint byte0 = byte_from_word(w0, b);
+            acc += e2m1_decode(byte0 & 0xFu) * scale * act_buf.act[ak + b * 2u];
+            acc += e2m1_decode(byte0 >> 4u) * scale * act_buf.act[ak + b * 2u + 1u];
+        }
+        for (uint b = 0u; b < 4u; ++b) {
+            uint byte1 = byte_from_word(w1, b);
+            acc += e2m1_decode(byte1 & 0xFu) * scale * act_buf.act[ak + 8u + b * 2u];
+            acc += e2m1_decode(byte1 >> 4u) * scale * act_buf.act[ak + 8u + b * 2u + 1u];
+        }
+    }
+    float div_word = uintBitsToFloat(slot_pool.data[slot_base + down_div_word0()]);
+    return acc / div_word;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x * kRowBlock + gl_LocalInvocationID.x;
+    for (uint t = 0u; t < kMaxTokens; ++t) { outbuf.out_data[t * kHidden + row] = 0.0; }
+    for (uint j = 0u; j < kMaxJobs; ++j) {
+        uint count = job_count(j);
+        if (count == 0u) { continue; }
+        uint slot_base = job_slot(j) * packed_words();
+        for (uint k = 0u; k < count; ++k) {
+            uint act_off = (j * kMaxTokens + k) * kIntermediate;
+            float y      = down_row_dot(slot_base, row, act_off);
+            outbuf.out_data[job_token(j, k) * kHidden + row] += job_weight(j, k) * y;
+        }
+    }
+}

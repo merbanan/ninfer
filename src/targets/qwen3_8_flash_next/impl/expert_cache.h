@@ -4,6 +4,9 @@
 #include "ops/sparse_moe/cpu/sparse_moe_cpu.h"
 #include "targets/qwen3_8_flash_next/impl/model_view.h"
 #include "targets/qwen3_8_flash_next/impl/moe_workspace.h"
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+#include "targets/qwen3_8_flash_next/impl/vk/vk_experts.h"
+#endif
 
 #include <cuda_runtime.h>
 
@@ -169,6 +172,13 @@ private:
 
     std::unique_ptr<ops::cpu::SpinPool> cpu_pool_;
     FlashNextOffloadStats stats_;
+
+#if defined(NINFER_FLASH_NEXT_VULKAN)
+    // The RX 570 (Vulkan) tier between this cache and the CPU: decode calls only (T <=
+    // policy_.host_max_tokens). nullptr when disabled or unavailable; every use is null-checked.
+    std::unique_ptr<FlashNextVkExperts> vk_;
+    bool vk_tried_ = false;
+#endif
 };
 
 // The process-wide cache flash_next_moe uses for host-resident expert banks, created on first

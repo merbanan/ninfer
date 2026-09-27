@@ -401,3 +401,11 @@ ninfer_add_test(ninfer_qwen3_8_flash_next_expert_cpu_test
 ninfer_add_op_test(ninfer_qwen3_8_flash_next_expert_cache_test
   SOURCES targets/qwen3_8_flash_next/test_expert_cache.cpp
   LIBRARIES ninfer_qwen3_8_flash_next)
+if(NINFER_VULKAN_EXPERTS)
+  # Only built (let alone run) when the RX 570 Vulkan expert tier is compiled in; unlike the
+  # SKIP_RETURN_CODE below (no AMD Vulkan device at runtime), NINFER_VULKAN_EXPERTS=OFF (the
+  # default) means the implementation isn't in the library to link against at all.
+  ninfer_add_op_test(ninfer_qwen3_8_flash_next_vk_experts_test
+    SOURCES targets/qwen3_8_flash_next/test_vk_experts.cpp
+    LIBRARIES ninfer_qwen3_8_flash_next)
+endif()
