@@ -103,12 +103,26 @@ With the sm_70 build, `--offload-experts` keeps the 35B-A3B routed experts in ho
 device expert cache and computes cache misses on the CPU or uploads them, whichever is cheaper, so
 the model runs on 8 GB Volta/Turing cards. On an RTX 2060 SUPER with a Ryzen 9 3900X it decodes at
 55-68 tok/s on short prompts and prefills an 18K-token agent prompt at 1,130 tok/s (llama.cpp on
-the same machine: 31.8 and 761). Convert the published artifact once, then:
+the same machine: 31.8 and 761).
+
+Download the published artifact (22.8 GB) with the Hugging Face CLI, or with `curl`, which resumes
+an interrupted download:
+
+```bash
+hf download neroued/Qwen3.6-35B-A3B-NInfer qwen3_6_35b_a3b.ninfer --local-dir models
+# or
+curl -L -C - -o models/qwen3_6_35b_a3b.ninfer \
+  https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/main/qwen3_6_35b_a3b.ninfer
+echo "3e33297645dc33557751be1a3c407a74ed7c00f34909b5d4e8cfdce91b3dbe84  models/qwen3_6_35b_a3b.ninfer" | sha256sum -c
+```
+
+It uses a newer container format; convert it once (another 22.8 GB; the original can be deleted
+afterwards), then run:
 
 ```bash
 python3 -m tools.convert.qwen3_6_35b_a3b.from_published_v3 \
-  --published qwen3_6_35b_a3b.ninfer --out qwen3_6_35b_a3b.v2.ninfer
-ninfer qwen3_6_35b_a3b.v2.ninfer --offload-experts --max-context 8192 --prompt "Hello"
+  --published models/qwen3_6_35b_a3b.ninfer --out models/qwen3_6_35b_a3b.v2.ninfer
+ninfer models/qwen3_6_35b_a3b.v2.ninfer --offload-experts --max-context 8192 --prompt "Hello"
 ```
 
 Details and measurements: [V100 port](docs/v100.md#qwen36-35b-a3b-with-experts-in-host-memory).
@@ -121,8 +135,23 @@ on the CPU or uploaded. On an RTX 2060 SUPER with a Ryzen 9 3900X and 60 GB of R
 about 6 tok/s and prefills at 25-36 tok/s. It is bound by host memory: most experts come from NVMe
 through the page cache.
 
+Download the early-access preview artifact (113.3 GB, one file; keep it on an NVMe drive, since
+experts that do not fit in RAM are read from it during inference):
+
 ```bash
-ninfer qwen3_8_flash_next_mixed.ninfer --max-context 32768 --kv-dtype fp8 --prefill-chunk 2048 \
+hf download igorls/Qwen3.8-Flash-Next-mixed-NInfer qwen3_8_flash_next_mixed.ninfer \
+  --revision preview-2026-09-07 --local-dir models
+# or
+curl -L -C - -o models/qwen3_8_flash_next_mixed.ninfer \
+  https://huggingface.co/igorls/Qwen3.8-Flash-Next-mixed-NInfer/resolve/preview-2026-09-07/qwen3_8_flash_next_mixed.ninfer
+echo "3d383e51963aafd4318dfd04c8dc63ee7df11768de19d9ab58dbba44460d1d02  models/qwen3_8_flash_next_mixed.ninfer" | sha256sum -c
+```
+
+A single stream can be slow; `curl -r <start>-<end>` fetches byte ranges, so several ranges can
+download in parallel and be concatenated in order afterwards. The artifact needs no conversion:
+
+```bash
+ninfer models/qwen3_8_flash_next_mixed.ninfer --max-context 32768 --kv-dtype fp8 --prefill-chunk 2048 \
   --prompt "Hello"
 ```
 
