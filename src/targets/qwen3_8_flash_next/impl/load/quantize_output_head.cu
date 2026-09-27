@@ -31,7 +31,7 @@ constexpr std::size_t kStagingBudgetBytes = 64ULL << 20;
 // at compile time; the second pass costs ~1 ms over the 1.27 GB head, once, at load.
 __global__ __launch_bounds__(kThreads, 2) void quantize_row_kernel(
     const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
-    float* __restrict__ scales, int columns) {
+    __nv_bfloat16* __restrict__ scales, int columns) {
     constexpr int warps = kThreads / 32;
     __shared__ float warp_maxima[warps];
     __shared__ float row_scale;
@@ -58,7 +58,14 @@ __global__ __launch_bounds__(kThreads, 2) void quantize_row_kernel(
     if (warp == 0) {
         maximum = lane < warps ? warp_maxima[lane] : 0.0F;
         maximum = ops::warp_max(maximum);
-        if (lane == 0) { row_scale = maximum > 0.0F ? maximum / 448.0F : 0.0F; }
+        if (lane == 0) {
+            // The shared FP8 ops take BF16 row scales: round amax / 448 up to BF16 so the codes
+            // are formed against the stored scale exactly and the largest one stays finite.
+            const float exact    = maximum > 0.0F ? maximum / 448.0F : 0.0F;
+            std::uint32_t bits   = __float_as_uint(exact);
+            if ((bits & 0xFFFFU) != 0U) { bits = (bits + 0x10000U) & 0xFFFF0000U; }
+            row_scale = __uint_as_float(bits);
+        }
     }
     __syncthreads();
 
@@ -69,7 +76,7 @@ __global__ __launch_bounds__(kThreads, 2) void quantize_row_kernel(
         const float2 scaled = make_float2(value.x * inverse, value.y * inverse);
         output_pairs[pair]  = __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
     }
-    if (tid == 0) { scales[row] = scale; }
+    if (tid == 0) { scales[row] = __float2bfloat16_rn(scale); } // exact: scale is a BF16 value
 }
 
 __global__ void gather_rows_kernel(
@@ -92,15 +99,15 @@ Weight make_fp8_view_sized(void* payload, std::size_t payload_bytes, std::int32_
     const std::uint64_t codes        = static_cast<std::uint64_t>(rows) * cols;
     const std::uint64_t scale_offset = (codes + 255U) & ~std::uint64_t{255U};
     auto* bytes                      = static_cast<std::byte*>(payload);
-    const std::int64_t scale_stride  = static_cast<std::int64_t>(rows) * 4;
+    const std::int64_t scale_stride  = static_cast<std::int64_t>(rows) * 2;
     Weight out{};
     out.payload         = payload;
     out.payload_bytes   = payload_bytes;
     out.qdata           = payload;
     out.scales          = bytes + scale_offset;
-    out.qtype           = QType::FP8_E4M3FN_ROW_F32S;
+    out.qtype           = QType::FP8_E4M3FN_ROW_BF16S;
     out.layout          = QuantLayout::RowScale;
-    out.scale_dtype     = DType::FP32;
+    out.scale_dtype     = DType::BF16;
     out.n               = rows;
     out.k               = cols;
     out.group           = cols;
@@ -111,7 +118,7 @@ Weight make_fp8_view_sized(void* payload, std::size_t payload_bytes, std::int32_
     out.padded_shape[0] = rows;
     out.padded_shape[1] = cols;
     out.scale_ne[0]     = rows;
-    out.scale_nb[0]     = 4;
+    out.scale_nb[0]     = 2;
     out.scale_nb[1]     = scale_stride;
     out.scale_nb[2]     = scale_stride;
     out.scale_nb[3]     = scale_stride;
@@ -186,7 +193,7 @@ void quantize_bf16_rows_to_fp8_e4m3_row_f32s(const void* bf16_rows, DeviceBuffer
     const std::uint64_t codes        = static_cast<std::uint64_t>(rows) * cols;
     const std::uint64_t scale_offset = (codes + 255U) & ~std::uint64_t{255U};
     auto* code_ptr                   = static_cast<std::uint8_t*>(payload.p);
-    auto* scale_ptr = reinterpret_cast<float*>(static_cast<std::byte*>(payload.p) + scale_offset);
+    auto* scale_ptr = reinterpret_cast<__nv_bfloat16*>(static_cast<std::byte*>(payload.p) + scale_offset);
 
     cudaPointerAttributes attributes{};
     const cudaError_t pointer_status = cudaPointerGetAttributes(&attributes, bf16_rows);
@@ -279,6 +286,36 @@ void gather_head_rows_bf16_from_host(std::span<const std::byte> src_rows,
     }
 
     dst_head = make_bf16_view(dst_payload.p, dst_payload.bytes, rows, cols);
+}
+
+namespace {
+__global__ void fp8_scales_f32_to_bf16_kernel(const float* __restrict__ source, __nv_bfloat16* __restrict__ target,
+                                              int rows) {
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row < rows) { target[row] = __float2bfloat16_rn(source[row]); }
+}
+} // namespace
+
+void fp8_row_f32s_to_bf16s_in_place(Weight& weight, cudaStream_t stream) {
+    if (weight.qtype != QType::FP8_E4M3FN_ROW_F32S || weight.scale_dtype != DType::FP32 ||
+        weight.layout != QuantLayout::RowScale || weight.scales == nullptr || weight.n <= 0) {
+        throw std::invalid_argument("Flash-Next FP8 scale conversion needs an FP8 row-F32 weight");
+    }
+    const int rows = weight.n;
+    DeviceBuffer source(static_cast<std::size_t>(rows) * sizeof(float));
+    auto* scales = const_cast<void*>(weight.scales);
+    CUDA_CHECK(cudaMemcpyAsync(source.p, scales, source.bytes, cudaMemcpyDeviceToDevice, stream));
+    fp8_scales_f32_to_bf16_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(
+        static_cast<const float*>(source.p), static_cast<__nv_bfloat16*>(scales), rows);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream)); // `source` is freed as this scope exits
+    const std::int64_t stride = static_cast<std::int64_t>(rows) * 2;
+    weight.qtype       = QType::FP8_E4M3FN_ROW_BF16S;
+    weight.scale_dtype = DType::BF16;
+    weight.scale_nb[0] = 2;
+    weight.scale_nb[1] = stride;
+    weight.scale_nb[2] = stride;
+    weight.scale_nb[3] = stride;
 }
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

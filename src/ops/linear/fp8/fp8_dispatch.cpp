@@ -19,8 +19,24 @@ enum class Fp8LinearRoute : std::uint8_t {
     A8,
 };
 
+#ifdef NINFER_VOLTA_BUILD
+// A shape outside the tuned problem set (another model's projections) that the shape-generic
+// QPN kernel covers. It runs the A16 route only, in 32-token passes over the weight.
+bool volta_generic_problem(std::int32_t output_rows, std::int32_t input_rows) {
+    return !is_fp8_linear_problem(output_rows, input_rows) &&
+           fp8_volta_qpn_supported(output_rows, input_rows, 1);
+}
+#endif
+
 Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, LinearPolicy policy,
                              std::int32_t tokens) {
+#ifdef NINFER_VOLTA_BUILD
+    if (tokens > 0 && volta_generic_problem(output_rows, input_rows) &&
+        (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+         policy == LinearPolicy::AllowA4)) {
+        return Fp8LinearRoute::A16;
+    }
+#endif
     if (tokens <= 0 || !is_fp8_linear_problem(output_rows, input_rows)) {
         throw std::invalid_argument("fp8 linear: unsupported shape");
     }
@@ -54,7 +70,12 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena* workspace,
                 cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    // Only consulted when QPN cannot take the shape, which a generic problem never reaches.
+    const auto problem = [&] { return resolve_fp8_problem(weight.n, weight.k); };
+#else
     const Fp8Problem problem = resolve_fp8_problem(weight.n, weight.k);
+#endif
 #ifndef NINFER_VOLTA_BUILD
     if (problem == Fp8Problem::Vocabulary && x.ne[1] >= kFp8VocabularyFirstA16GemmT) {
         launch_fp8_vocabulary_a16_gemm(x, weight, out, stream);
@@ -64,7 +85,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceAre
                                                                  : fp8_linear_small_t_max(problem);
 #else
     const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
-    const std::int32_t chunk = qpn ? kFp8VoltaQpnMaxTokens : fp8_linear_small_t_max(problem);
+    const std::int32_t chunk = qpn ? kFp8VoltaQpnMaxTokens : fp8_linear_small_t_max(problem());
     if (!qpn) { throw std::logic_error("fp8 Volta problem has no QPN route"); }
     std::optional<WorkspaceArena::Scope> scope;
     DeviceSpan activation;
@@ -136,6 +157,13 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::i
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("fp8 linear workspace: invalid token interval");
     }
+#ifdef NINFER_VOLTA_BUILD
+    if (volta_generic_problem(output_rows, input_rows)) {
+        (void)resolve_route(output_rows, input_rows, policy, min_tokens);
+        return static_cast<std::size_t>(input_rows) * std::min(max_tokens, kFp8VoltaQpnMaxTokens) *
+               sizeof(std::uint16_t);
+    }
+#endif
     const Fp8Problem problem = resolve_fp8_problem(output_rows, input_rows);
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
     (void)resolve_route(output_rows, input_rows, policy, max_tokens);

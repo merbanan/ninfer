@@ -41,6 +41,13 @@ constexpr auto kControlLaunchers = make_launchers<ControlGeometry>(
     std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
 constexpr auto kOutputLaunchers = make_launchers<OutputGeometry>(
     std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+// Qwen3.8-Flash-Next shapes (K = 2560).
+constexpr auto kNgramKeyLaunchers = make_launchers<Bf16GemvGeometry<10240, 2560>>(
+    std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+constexpr auto kNgramValueLaunchers = make_launchers<Bf16GemvGeometry<2560, 2560>>(
+    std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+constexpr auto kIndexerLaunchers = make_launchers<Bf16GemvGeometry<640, 2560>>(
+    std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
 
 } // namespace
 
@@ -53,6 +60,16 @@ void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cud
     if (weight.n == OutputGeometry::kOutputRows && weight.k == OutputGeometry::kInputRows) {
         kOutputLaunchers[index](x, weight, out, stream);
         return;
+    }
+    if (weight.k == 2560) {
+        const auto* table = weight.n == 10240 ? &kNgramKeyLaunchers
+                            : weight.n == 2560 ? &kNgramValueLaunchers
+                            : weight.n == 640  ? &kIndexerLaunchers
+                                               : nullptr;
+        if (table != nullptr) {
+            (*table)[index](x, weight, out, stream);
+            return;
+        }
     }
     throw std::invalid_argument("bf16 linear small-T: unsupported exact problem");
 }

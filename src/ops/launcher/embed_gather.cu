@@ -16,10 +16,10 @@ constexpr int kQ6GroupedBlock = kEmbedGatherQ6Group * kEmbedGatherQ6GroupsPerBlo
 constexpr int kW8GroupedBlock = 32;
 constexpr int kW8RowBlock     = 256;
 
-template <int BlocksPerToken, int Threads>
+template <int BlocksPerToken, int Threads, int D = kEmbedGatherFp8D>
 void launch_fp8(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
     const int grid = ids.ne[0] * BlocksPerToken;
-    embed_gather_fp8_kernel<BlocksPerToken, Threads><<<grid, Threads, 0, stream>>>(
+    embed_gather_fp8_kernel<BlocksPerToken, Threads, D><<<grid, Threads, 0, stream>>>(
         static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
         static_cast<const __nv_bfloat16*>(table.scales), static_cast<__nv_bfloat16*>(out.data));
 }
@@ -151,7 +151,9 @@ void embed_gather_w8_launch(const Tensor& ids, const Weight& table, Tensor& out,
 void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out,
                              cudaStream_t stream) {
     const std::int32_t T = ids.ne[0];
-    if (T <= 176)
+    if (table.k == 2560)
+        launch_fp8<5, 128, 2560>(ids, table, out, stream);
+    else if (T <= 176)
         launch_fp8<10, 128>(ids, table, out, stream);
     else
         launch_fp8<5, 128>(ids, table, out, stream);

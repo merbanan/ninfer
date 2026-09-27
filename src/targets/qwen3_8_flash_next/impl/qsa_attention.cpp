@@ -35,24 +35,25 @@ bool exact_bf16_weight(const Weight& weight, std::int32_t rows, std::int32_t col
            aligned_to(weight.qdata, 16);
 }
 
-bool exact_fp8_f32_weight(const Weight& weight, std::int32_t rows, std::int32_t columns) {
+bool exact_fp8_weight(const Weight& weight, std::int32_t rows, std::int32_t columns) {
     const std::uint64_t codes        = static_cast<std::uint64_t>(rows) * columns;
     const std::uint64_t scale_offset = (codes + 255U) & ~std::uint64_t{255U};
     const auto* payload              = static_cast<const std::byte*>(weight.payload);
-    const std::int64_t scale_stride  = static_cast<std::int64_t>(rows) * 4;
-    return weight.qtype == QType::FP8_E4M3FN_ROW_F32S && weight.layout == QuantLayout::RowScale &&
-           weight.scale_dtype == DType::FP32 && weight.group_size == columns &&
+    const std::int64_t scale_stride  = static_cast<std::int64_t>(rows) * 2;
+    return weight.qtype == QType::FP8_E4M3FN_ROW_BF16S &&
+           (weight.layout == QuantLayout::RowScale || weight.layout == QuantLayout::VoltaQpnPrepacked) &&
+           weight.scale_dtype == DType::BF16 && weight.group_size == columns &&
            weight.group == columns && weight.n == rows && weight.k == columns && weight.ndim == 2 &&
            weight.shape[0] == rows && weight.shape[1] == columns && weight.shape[2] == 1 &&
            weight.shape[3] == 1 && weight.padded_shape[0] == rows &&
            weight.padded_shape[1] == columns && weight.padded_shape[2] == 1 &&
            weight.padded_shape[3] == 1 && weight.scale_ne[0] == rows && weight.scale_ne[1] == 1 &&
-           weight.scale_ne[2] == 1 && weight.scale_ne[3] == 1 && weight.scale_nb[0] == 4 &&
+           weight.scale_ne[2] == 1 && weight.scale_ne[3] == 1 && weight.scale_nb[0] == 2 &&
            weight.scale_nb[1] == scale_stride && weight.scale_nb[2] == scale_stride &&
            weight.scale_nb[3] == scale_stride && payload != nullptr && weight.qdata == payload &&
            weight.scales == payload + scale_offset && weight.qhigh == nullptr &&
            weight.high_plane_bytes == 0 &&
-           weight.payload_bytes >= scale_offset + static_cast<std::uint64_t>(rows) * 4 &&
+           weight.payload_bytes >= scale_offset + static_cast<std::uint64_t>(rows) * 2 &&
            aligned_to(weight.qdata, 16) && aligned_to(weight.scales, 16);
 }
 
@@ -60,7 +61,7 @@ bool exact_projection_weight(const Weight& weight, std::int32_t rows, std::int32
     if (weight.qtype == QType::BF16_CTRL) {
         return exact_bf16_weight(weight, rows, columns);
     }
-    return exact_fp8_f32_weight(weight, rows, columns);
+    return exact_fp8_weight(weight, rows, columns);
 }
 
 } // namespace
@@ -74,9 +75,9 @@ std::size_t flash_next_qsa_attention_workspace_capacity_bytes(std::int32_t batch
     {
         auto scope = layout.scope();
         const std::size_t qgkv_ws = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_F32S, 13'312, 2'560, ops::LinearPolicy::AllowA8, 1, batch);
+            QType::FP8_E4M3FN_ROW_BF16S, 13'312, 2'560, ops::LinearPolicy::AllowA8, 1, batch);
         const std::size_t out_ws = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_F32S, 2'560, 6'144, ops::LinearPolicy::AllowA8, 1, batch);
+            QType::FP8_E4M3FN_ROW_BF16S, 2'560, 6'144, ops::LinearPolicy::AllowA8, 1, batch);
         const std::size_t attention_ws = batch <= 8
             ? ops::selected_block_attention_workspace_capacity_bytes(batch) : 0;
         (void)layout.alloc_bytes(std::max({qgkv_ws, out_ws, attention_ws}), 256);

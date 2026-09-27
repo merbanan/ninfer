@@ -653,6 +653,58 @@ down_prefill_volta_kernel(const __nv_bfloat16* __restrict__ x,
             __float2bfloat16_rn(ops::silu(sum * 0.25F));
     }
 }
+
+// out[token][row] = W[row][:] . low_rank[token][:] for W [10240, 320] (the Ampere route's
+// bf16_gemm_mma_kernel uses sm_80 MMA). A CTA owns 64 rows x 32 tokens; K = 320 is staged in four
+// steps of 80 columns (31 KB of shared memory), and each thread accumulates 2 rows x 4 tokens in FP32.
+__global__ void __launch_bounds__(256)
+up_prefill_volta_kernel(const __nv_bfloat16* __restrict__ low_rank,
+                        const __nv_bfloat16* __restrict__ weight,
+                        __nv_bfloat16* __restrict__ up_gemm, int tokens) {
+    constexpr int kRows = 64, kTokens = 32, kHalf = kLowRank / 4, kPad = kHalf + 2;
+    __shared__ float s_w[kRows][kPad];
+    __shared__ float s_x[kTokens][kPad];
+    const int tid       = static_cast<int>(threadIdx.x);
+    const int row0      = static_cast<int>(blockIdx.x) * kRows;
+    const int token0    = static_cast<int>(blockIdx.y) * kTokens;
+    const int r         = (tid & 31) * 2;  // rows r, r + 1
+    const int t         = (tid >> 5) * 4;  // tokens t .. t + 3
+    float acc[2][4] = {};
+    for (int half = 0; half < 4; ++half) {
+        __syncthreads();
+        for (int i = tid; i < kRows * kHalf; i += 256) {
+            const int rr = i / kHalf, kk = i % kHalf;
+            s_w[rr][kk] = __bfloat162float(weight[static_cast<std::int64_t>(row0 + rr) * kLowRank + half * kHalf + kk]);
+        }
+        for (int i = tid; i < kTokens * kHalf; i += 256) {
+            const int tt = i / kHalf, kk = i % kHalf;
+            const int token = token0 + tt;
+            s_x[tt][kk] = token < tokens
+                              ? __bfloat162float(low_rank[static_cast<std::int64_t>(token) * kLowRank + half * kHalf + kk])
+                              : 0.0F;
+        }
+        __syncthreads();
+        for (int kk = 0; kk < kHalf; ++kk) {
+            const float w0 = s_w[r][kk], w1 = s_w[r + 1][kk];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float x = s_x[t + j][kk];
+                acc[0][j]     = fmaf(w0, x, acc[0][j]);
+                acc[1][j]     = fmaf(w1, x, acc[1][j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int token = token0 + t + j;
+        if (token >= tokens) { continue; }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            up_gemm[static_cast<std::int64_t>(token) * (kStreams * kHidden) + row0 + r + i] =
+                __float2bfloat16_rn(acc[i][j]);
+        }
+    }
+}
 #endif
 
 #if !defined(NINFER_VOLTA_BUILD)
@@ -718,6 +770,12 @@ void launch_up_prefill(const __nv_bfloat16* low_rank, const __nv_bfloat16* weigh
 
 void launch_up_prefill_dispatch(const __nv_bfloat16* low_rank, const __nv_bfloat16* weight,
                                 __nv_bfloat16* up_gemm, int tokens, cudaStream_t stream) {
+#if defined(NINFER_VOLTA_BUILD)
+    up_prefill_volta_kernel<<<dim3(10240 / 64, (tokens + 31) / 32), 256, 0, stream>>>(low_rank, weight,
+                                                                                     up_gemm, tokens);
+    CUDA_CHECK(cudaGetLastError());
+    return;
+#endif
     if ((tokens % UpSched::kBlockCols) == 0) {
         launch_up_prefill<true>(low_rank, weight, up_gemm, tokens, stream);
     } else {

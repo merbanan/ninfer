@@ -13,7 +13,9 @@ namespace ninfer::targets::qwen3_8_flash_next::detail {
 inline constexpr std::int32_t kOutputHeadRows    = 248'320;
 inline constexpr std::int32_t kOutputHeadColumns = 2'560;
 
-// E4M3FN max finite is 448. Scale is per-row amax/448. Codes use round-to-nearest-even
+// E4M3FN max finite is 448. Scale is per-row amax/448 rounded up to BF16, stored as BF16
+// (FP8_E4M3FN_ROW_BF16S, the row-scaled FP8 form the shared ops execute); codes are formed
+// against that stored scale. Codes use round-to-nearest-even
 // saturate-to-finite conversion (__nv_cvt_float2_to_fp8x2, __NV_SATFINITE, __NV_E4M3).
 [[nodiscard]] std::size_t flash_next_fp8_output_head_payload_bytes();
 [[nodiscard]] std::size_t flash_next_fp8_head_payload_bytes(std::int32_t rows,
@@ -46,5 +48,10 @@ void gather_head_rows_bf16_from_host(std::span<const std::byte> src_rows,
                                      std::int32_t src_rows_count, std::int32_t cols,
                                      DeviceBuffer& dst_payload, Weight& dst_head,
                                      cudaStream_t stream);
+
+// The artifact stores its FP8 projections with FP32 row scales (FP8_E4M3FN_ROW_F32S); the shared
+// FP8 ops execute BF16 row scales. Rewrites the scale plane in place (BF16 values at the start of
+// the FP32 plane, round-to-nearest: at most 2^-9 relative per row) and retypes the view.
+void fp8_row_f32s_to_bf16s_in_place(Weight& weight, cudaStream_t stream);
 
 } // namespace ninfer::targets::qwen3_8_flash_next::detail

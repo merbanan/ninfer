@@ -38,24 +38,25 @@ bool exact_bf16_weight(const Weight& weight, std::int32_t rows, std::int32_t col
            aligned_to(weight.qdata, 16);
 }
 
-bool exact_fp8_f32_weight(const Weight& weight, std::int32_t rows, std::int32_t columns) {
+bool exact_fp8_weight(const Weight& weight, std::int32_t rows, std::int32_t columns) {
     const std::uint64_t code_bytes   = static_cast<std::uint64_t>(rows) * columns;
     const std::uint64_t scale_offset = (code_bytes + 255U) & ~std::uint64_t{255U};
     const auto* payload              = static_cast<const std::byte*>(weight.payload);
-    return weight.qtype == QType::FP8_E4M3FN_ROW_F32S && weight.layout == QuantLayout::RowScale &&
-           weight.scale_dtype == DType::FP32 && weight.group_size == columns &&
+    return weight.qtype == QType::FP8_E4M3FN_ROW_BF16S &&
+           (weight.layout == QuantLayout::RowScale || weight.layout == QuantLayout::VoltaQpnPrepacked) &&
+           weight.scale_dtype == DType::BF16 && weight.group_size == columns &&
            weight.group == columns && weight.n == rows && weight.k == columns && weight.ndim == 2 &&
            weight.shape[0] == rows && weight.shape[1] == columns && weight.shape[2] == 1 &&
            weight.shape[3] == 1 && weight.padded_shape[0] == rows &&
            weight.padded_shape[1] == columns && weight.padded_shape[2] == 1 &&
            weight.padded_shape[3] == 1 && weight.scale_ne[0] == rows && weight.scale_ne[1] == 1 &&
-           weight.scale_ne[2] == 1 && weight.scale_ne[3] == 1 && weight.scale_nb[0] == 4 &&
-           weight.scale_nb[1] == static_cast<std::int64_t>(rows) * 4 &&
-           weight.scale_nb[2] == static_cast<std::int64_t>(rows) * 4 &&
-           weight.scale_nb[3] == static_cast<std::int64_t>(rows) * 4 && payload != nullptr &&
+           weight.scale_ne[2] == 1 && weight.scale_ne[3] == 1 && weight.scale_nb[0] == 2 &&
+           weight.scale_nb[1] == static_cast<std::int64_t>(rows) * 2 &&
+           weight.scale_nb[2] == static_cast<std::int64_t>(rows) * 2 &&
+           weight.scale_nb[3] == static_cast<std::int64_t>(rows) * 2 && payload != nullptr &&
            weight.qdata == payload && weight.scales == payload + scale_offset &&
            weight.qhigh == nullptr && weight.high_plane_bytes == 0 &&
-           weight.payload_bytes >= scale_offset + static_cast<std::uint64_t>(rows) * 4 &&
+           weight.payload_bytes >= scale_offset + static_cast<std::uint64_t>(rows) * 2 &&
            aligned_to(weight.qdata, 16) && aligned_to(weight.scales, 16);
 }
 
@@ -71,9 +72,9 @@ std::size_t flash_next_gdn_workspace_capacity_bytes(std::int32_t min_batch,
     {
         auto scope = layout.scope();
         const std::size_t qkvz_ws = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_F32S, 16'384, 2'560, ops::LinearPolicy::AllowA8, 1, max_batch);
+            QType::FP8_E4M3FN_ROW_BF16S, 16'384, 2'560, ops::LinearPolicy::AllowA8, 1, max_batch);
         const std::size_t out_ws = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_F32S, 2'560, 6'144, ops::LinearPolicy::AllowA8, 1, max_batch);
+            QType::FP8_E4M3FN_ROW_BF16S, 2'560, 6'144, ops::LinearPolicy::AllowA8, 1, max_batch);
         const std::size_t gdn_op_ws =
             ops::gated_delta_net_workspace_capacity_bytes(16, 48, true, max_batch, max_batch);
         (void)layout.alloc_bytes(std::max({qkvz_ws, out_ws, gdn_op_ws}), 256);
@@ -103,8 +104,8 @@ void flash_next_gdn_decode(const Tensor& input, const GdnWeights& weights,
         !exact_tensor(weights.dt_bias, DType::BF16, 48) ||
         !exact_bf16_weight(weights.a_b_projection, 96, 2'560) ||
         !exact_tensor(weights.norm, DType::BF16, 128) ||
-        !exact_fp8_f32_weight(weights.query_key_value_z, 16'384, 2'560) ||
-        !exact_fp8_f32_weight(weights.output, 2'560, 6'144) || stream == nullptr) {
+        !exact_fp8_weight(weights.query_key_value_z, 16'384, 2'560) ||
+        !exact_fp8_weight(weights.output, 2'560, 6'144) || stream == nullptr) {
         throw std::invalid_argument("Flash-Next GDN received an invalid exact target view");
     }
 
@@ -169,8 +170,8 @@ void flash_next_gdn_prefill_chunk(const Tensor& input, const GdnWeights& weights
         !exact_tensor(weights.dt_bias, DType::BF16, 48) ||
         !exact_bf16_weight(weights.a_b_projection, 96, 2'560) ||
         !exact_tensor(weights.norm, DType::BF16, 128) ||
-        !exact_fp8_f32_weight(weights.query_key_value_z, 16'384, 2'560) ||
-        !exact_fp8_f32_weight(weights.output, 2'560, 6'144) ||
+        !exact_fp8_weight(weights.query_key_value_z, 16'384, 2'560) ||
+        !exact_fp8_weight(weights.output, 2'560, 6'144) ||
         source_slot < 0 || source_slot >= state_slots || destination_slot < 0 ||
         destination_slot >= state_slots || stream == nullptr) {
         throw std::invalid_argument("Flash-Next GDN prefill chunk received an invalid view");

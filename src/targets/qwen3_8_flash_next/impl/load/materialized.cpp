@@ -5,6 +5,7 @@
 #include "core/host_memory.h"
 #include "targets/qwen3_8_flash_next/impl/load/quantize_nvfp4_expert_bank.h"
 #include "targets/qwen3_8_flash_next/impl/load/quantize_output_head.h"
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
 
 #include <algorithm>
 #include <chrono>
@@ -87,10 +88,24 @@ Weight bf16_weight(const artifact::MaterializedArtifact& backing, artifact::Obje
     return artifact::materialized_weight(backing, handle, NumericFormat::BF16, rows, columns);
 }
 
+// FP8 weights consumed by ops::linear: the sm_70 build's QPN kernels read the load-time permuted
+// code stream. Never applied to the FP8 token embedding, which the gather reads row-major.
+void prepack_fp8_for_linear(Weight& weight) {
+#if defined(NINFER_VOLTA_BUILD)
+    ops::detail::fp8_prepack_qpn_sm70(weight);
+    CUDA_CHECK(cudaDeviceSynchronize());
+#else
+    (void)weight;
+#endif
+}
+
 Weight fp8_weight(const artifact::MaterializedArtifact& backing, artifact::ObjectHandle handle,
                   std::int32_t rows, std::int32_t columns) {
-    return artifact::materialized_weight(backing, handle, NumericFormat::FP8_E4M3FN_ROW_F32S, rows,
-                                         columns);
+    Weight weight = artifact::materialized_weight(backing, handle, NumericFormat::FP8_E4M3FN_ROW_F32S,
+                                                  rows, columns);
+    fp8_row_f32s_to_bf16s_in_place(weight, cudaStream_t{});
+    prepack_fp8_for_linear(weight);
+    return weight;
 }
 
 // Host-mapped BF16 payload of a tensor bound with retain_mapped_tensor. The size check is the
@@ -327,6 +342,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         quantize_bf16_rows_to_fp8_e4m3_row_f32s(mapped_head.data(), output_head_fp8,
                                                 text.output_head, 248'320, 2'560, cudaStream_t{});
         CUDA_CHECK(cudaDeviceSynchronize());
+        prepack_fp8_for_linear(text.output_head);
     } else {
         raw_bf16_head    = bf16_weight(backing, plan.output_head, 248'320, 2'560);
         text.output_head = raw_bf16_head;
@@ -336,6 +352,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             quantize_bf16_output_head_to_fp8_e4m3_row_f32s(raw_bf16_head, output_head_fp8, fp8_head,
                                                            cudaStream_t{});
             CUDA_CHECK(cudaDeviceSynchronize());
+            prepack_fp8_for_linear(fp8_head);
             text.output_head = fp8_head;
         }
     }
@@ -370,6 +387,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             quantize_bf16_head_to_fp8_e4m3_row_f32s(bf16_proposal_head, proposal_head_fp8,
                                                     fp8_proposal_head, static_cast<std::int32_t>(K),
                                                     2'560, cudaStream_t{});
+            CUDA_CHECK(cudaDeviceSynchronize());
+            prepack_fp8_for_linear(fp8_proposal_head);
             final_proposal_head = fp8_proposal_head;
         }
         CUDA_CHECK(cudaDeviceSynchronize());
