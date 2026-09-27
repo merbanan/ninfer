@@ -1,4 +1,5 @@
 #include "targets/qwen3_8_flash_next/impl/moe_kernels.h"
+#include "targets/qwen3_8_flash_next/impl/moe_prefill_turing.h"
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
@@ -2156,24 +2157,45 @@ void flash_next_moe_kernels_launch(const Tensor& input, const MoeWeights& weight
         } else {
             // Small-token SIMT W4A16 route avoids activation quantization overhead.
             // 2. Grouped Expert Gate & Up (SIMT W4A16)
-            constexpr int kGridY = 16;
-            const dim3 gate_grid(kIntermediate / 8, kGridY);
-            flash_next_moe_prefill_gate_up_kernel<<<gate_grid, 256, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input.data),
-                static_cast<const std::int32_t*>(workspace.expert_offsets.data),
-                static_cast<const std::int32_t*>(workspace.expert_counts.data),
-                static_cast<const std::int32_t*>(workspace.active_expert_ids.data),
-                static_cast<const std::int32_t*>(workspace.active_count.data),
-                static_cast<const std::int32_t*>(workspace.grouped_tokens.data),
-                static_cast<const std::int32_t*>(workspace.grouped_paths.data),
-                reinterpret_cast<const std::uint8_t*>(weights.expert_gate_up.codes),
-                reinterpret_cast<const std::uint8_t*>(weights.expert_gate_up.scales),
-                weights.expert_gate_up.weight_scale_divisors,
-                weights.expert_gate_up.code_bytes_per_expert,
-                weights.expert_gate_up.scale_bytes_per_expert,
-                workspace.expert_slots,
-                static_cast<__nv_bfloat16*>(workspace.activations.data));
-            CUDA_CHECK(cudaGetLastError());
+#if defined(NINFER_VOLTA_BUILD)
+            if (flash_next_moe_prefill_turing_enabled()) {
+                const FlashNextTuringGroups groups{
+                    static_cast<const std::int32_t*>(workspace.expert_offsets.data),
+                    static_cast<const std::int32_t*>(workspace.expert_counts.data),
+                    static_cast<const std::int32_t*>(workspace.active_expert_ids.data),
+                    static_cast<const std::int32_t*>(workspace.active_count.data),
+                    static_cast<const std::int32_t*>(workspace.grouped_tokens.data),
+                    static_cast<const std::int32_t*>(workspace.grouped_paths.data),
+                    workspace.expert_slots};
+                const FlashNextTuringBank bank{
+                    reinterpret_cast<const std::uint8_t*>(weights.expert_gate_up.codes),
+                    reinterpret_cast<const std::uint8_t*>(weights.expert_gate_up.scales),
+                    weights.expert_gate_up.weight_scale_divisors, weights.expert_gate_up.code_bytes_per_expert,
+                    weights.expert_gate_up.scale_bytes_per_expert};
+                flash_next_moe_prefill_turing_gate_up(groups, bank, input.data, workspace.activations.data,
+                                                      stream);
+            } else
+#endif
+            {
+                constexpr int kGridY = 16;
+                const dim3 gate_grid(kIntermediate / 8, kGridY);
+                flash_next_moe_prefill_gate_up_kernel<<<gate_grid, 256, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(input.data),
+                    static_cast<const std::int32_t*>(workspace.expert_offsets.data),
+                    static_cast<const std::int32_t*>(workspace.expert_counts.data),
+                    static_cast<const std::int32_t*>(workspace.active_expert_ids.data),
+                    static_cast<const std::int32_t*>(workspace.active_count.data),
+                    static_cast<const std::int32_t*>(workspace.grouped_tokens.data),
+                    static_cast<const std::int32_t*>(workspace.grouped_paths.data),
+                    reinterpret_cast<const std::uint8_t*>(weights.expert_gate_up.codes),
+                    reinterpret_cast<const std::uint8_t*>(weights.expert_gate_up.scales),
+                    weights.expert_gate_up.weight_scale_divisors,
+                    weights.expert_gate_up.code_bytes_per_expert,
+                    weights.expert_gate_up.scale_bytes_per_expert,
+                    workspace.expert_slots,
+                    static_cast<__nv_bfloat16*>(workspace.activations.data));
+                CUDA_CHECK(cudaGetLastError());
+            }
             stage_ledger_record(stream, FlashNextStageId::MoE_RoutedGateUp);
 
             // 3. Shared expert gate & up
@@ -2194,24 +2216,45 @@ void flash_next_moe_kernels_launch(const Tensor& input, const MoeWeights& weight
             stage_ledger_record(stream, FlashNextStageId::MoE_SharedGateUp);
 
             // 4. Grouped Down GEMM (SIMT W4A16)
-            constexpr int kDownGridY = 8;
-            const dim3 down_grid(kHidden / 16, kDownGridY);
-            flash_next_moe_prefill_down_kernel<<<down_grid, 256, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(workspace.activations.data),
-                static_cast<const std::int32_t*>(workspace.expert_offsets.data),
-                static_cast<const std::int32_t*>(workspace.expert_counts.data),
-                static_cast<const std::int32_t*>(workspace.active_expert_ids.data),
-                static_cast<const std::int32_t*>(workspace.active_count.data),
-                static_cast<const std::int32_t*>(workspace.grouped_tokens.data),
-                static_cast<const std::int32_t*>(workspace.grouped_paths.data),
-                reinterpret_cast<const std::uint8_t*>(weights.expert_down.codes),
-                reinterpret_cast<const std::uint8_t*>(weights.expert_down.scales),
-                weights.expert_down.weight_scale_divisors,
-                weights.expert_down.code_bytes_per_expert,
-                weights.expert_down.scale_bytes_per_expert,
-                workspace.expert_slots,
-                static_cast<float*>(workspace.down_intermediate.data));
-            CUDA_CHECK(cudaGetLastError());
+#if defined(NINFER_VOLTA_BUILD)
+            if (flash_next_moe_prefill_turing_enabled()) {
+                const FlashNextTuringGroups groups{
+                    static_cast<const std::int32_t*>(workspace.expert_offsets.data),
+                    static_cast<const std::int32_t*>(workspace.expert_counts.data),
+                    static_cast<const std::int32_t*>(workspace.active_expert_ids.data),
+                    static_cast<const std::int32_t*>(workspace.active_count.data),
+                    static_cast<const std::int32_t*>(workspace.grouped_tokens.data),
+                    static_cast<const std::int32_t*>(workspace.grouped_paths.data),
+                    workspace.expert_slots};
+                const FlashNextTuringBank bank{
+                    reinterpret_cast<const std::uint8_t*>(weights.expert_down.codes),
+                    reinterpret_cast<const std::uint8_t*>(weights.expert_down.scales),
+                    weights.expert_down.weight_scale_divisors, weights.expert_down.code_bytes_per_expert,
+                    weights.expert_down.scale_bytes_per_expert};
+                flash_next_moe_prefill_turing_down(groups, bank, workspace.activations.data,
+                                                   static_cast<float*>(workspace.down_intermediate.data), stream);
+            } else
+#endif
+            {
+                constexpr int kDownGridY = 8;
+                const dim3 down_grid(kHidden / 16, kDownGridY);
+                flash_next_moe_prefill_down_kernel<<<down_grid, 256, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(workspace.activations.data),
+                    static_cast<const std::int32_t*>(workspace.expert_offsets.data),
+                    static_cast<const std::int32_t*>(workspace.expert_counts.data),
+                    static_cast<const std::int32_t*>(workspace.active_expert_ids.data),
+                    static_cast<const std::int32_t*>(workspace.active_count.data),
+                    static_cast<const std::int32_t*>(workspace.grouped_tokens.data),
+                    static_cast<const std::int32_t*>(workspace.grouped_paths.data),
+                    reinterpret_cast<const std::uint8_t*>(weights.expert_down.codes),
+                    reinterpret_cast<const std::uint8_t*>(weights.expert_down.scales),
+                    weights.expert_down.weight_scale_divisors,
+                    weights.expert_down.code_bytes_per_expert,
+                    weights.expert_down.scale_bytes_per_expert,
+                    workspace.expert_slots,
+                    static_cast<float*>(workspace.down_intermediate.data));
+                CUDA_CHECK(cudaGetLastError());
+            }
             stage_ledger_record(stream, FlashNextStageId::MoE_RoutedDown);
 
             // 5. Shared Down & Top-K weighted reduction (SIMT)

@@ -7,6 +7,7 @@
 #include "targets/qwen3_8_flash_next/impl/expert_cache.h"
 #include "targets/qwen3_8_flash_next/impl/moe.h"
 #include "targets/qwen3_8_flash_next/impl/moe_kernels.h"
+#include "targets/qwen3_8_flash_next/impl/moe_prefill_turing.h"
 #include "targets/qwen3_8_flash_next/impl/moe_route.h"
 #include "targets/qwen3_8_flash_next/impl/moe_workspace.h"
 
@@ -237,6 +238,30 @@ int main() {
                                  scratch.ids, scratch.alpha, scratch.shared_scale, stream);
             });
             time("experts", [&] { flash_next_moe_kernels_launch(input, device_weights, scratch, out, stream); });
+            if (tokens > 8) {
+                // Turing tensor-core prefill against the SIMT kernels on the same routing.
+                std::vector<std::uint16_t> simt(x.size()), turing(x.size());
+                flash_next_moe_prefill_turing_override(false);
+                flash_next_moe_kernels_launch(input, device_weights, scratch, out, stream);
+                CUDA_CHECK(cudaMemcpyAsync(simt.data(), out.data, simt.size() * 2, cudaMemcpyDeviceToHost, stream));
+                time("simt", [&] { flash_next_moe_kernels_launch(input, device_weights, scratch, out, stream); });
+                flash_next_moe_prefill_turing_override(true);
+                flash_next_moe_kernels_launch(input, device_weights, scratch, out, stream);
+                CUDA_CHECK(cudaMemcpyAsync(turing.data(), out.data, turing.size() * 2, cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                time("turing", [&] { flash_next_moe_kernels_launch(input, device_weights, scratch, out, stream); });
+                double max_ref = 0.0, max_err = 0.0, sum_err = 0.0;
+                for (std::size_t i = 0; i < simt.size(); ++i) {
+                    const double r = from_bf16(simt[i]);
+                    max_ref        = std::max(max_ref, std::abs(r));
+                    max_err        = std::max(max_err, std::abs(r - from_bf16(turing[i])));
+                    sum_err += std::abs(r - from_bf16(turing[i]));
+                }
+                const bool ok = std::isfinite(max_err) && max_err <= 2e-2 * max_ref;
+                std::printf("  turing vs simt: max|ref| %.4g max err %.3g mean err %.3g %s\n", max_ref, max_err,
+                            sum_err / static_cast<double>(simt.size()), ok ? "ok" : "FAIL");
+                failures += ok ? 0 : 1;
+            }
             if (tokens <= 8) {
                 time("down", [&] {
                     flash_next_moe_down_launch(flash_next_moe_down_kernel_selection(), device_weights, scratch, tokens,

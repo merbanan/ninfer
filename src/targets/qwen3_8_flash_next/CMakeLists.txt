@@ -47,4 +47,17 @@ ninfer_cuda_archive(ninfer_qwen3_8_flash_next)
 
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   target_compile_definitions(ninfer_qwen3_8_flash_next PRIVATE NINFER_VOLTA_BUILD=1)
+  # Turing tensor-core bodies of the grouped prefill expert GEMMs (mma.m16n8k8): built for sm_75
+  # as well, in a non-RDC archive behind host launchers so sm_75 code stays out of the sm_70
+  # device link of the target.
+  add_library(ninfer_qwen3_8_flash_next_turing_non_rdc STATIC impl/moe_prefill_turing.cu)
+  ninfer_internal_includes(ninfer_qwen3_8_flash_next_turing_non_rdc)
+  set_target_properties(ninfer_qwen3_8_flash_next_turing_non_rdc PROPERTIES
+    CUDA_ARCHITECTURES "70;75"
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+  target_compile_options(ninfer_qwen3_8_flash_next_turing_non_rdc PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
+  target_link_libraries(ninfer_qwen3_8_flash_next_turing_non_rdc PRIVATE ninfer_core CUDA::cudart)
+  target_link_libraries(ninfer_qwen3_8_flash_next PRIVATE ninfer_qwen3_8_flash_next_turing_non_rdc)
 endif()
