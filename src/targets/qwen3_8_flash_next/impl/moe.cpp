@@ -1,5 +1,7 @@
 #include "targets/qwen3_8_flash_next/impl/moe.h"
 
+#include "targets/qwen3_8_flash_next/impl/expert_cache.h"
+
 #include "core/layout.h"
 #include "targets/qwen3_8_flash_next/impl/moe_kernels.h"
 #include "targets/qwen3_8_flash_next/impl/moe_route.h"
@@ -10,6 +12,8 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -39,6 +43,7 @@ bool exact_expert_bank(const Nvfp4ExpertBankView& bank, std::int32_t rows, std::
            aligned_to(bank.scales, 16) && aligned_to(bank.weight_scale_divisors, 16);
 }
 
+
 bool exact_bf16_expert_bank(const Bf16ExpertBankView& bank, std::int32_t rows, std::int32_t columns) {
     const std::uint64_t elements = static_cast<std::uint64_t>(rows) * columns;
     return bank.experts == 512 && bank.rows == rows && bank.columns == columns &&
@@ -47,6 +52,27 @@ bool exact_bf16_expert_bank(const Bf16ExpertBankView& bank, std::int32_t rows, s
 }
 
 } // namespace
+
+// The process-wide expert cache of the host-resident banks (one runtime per process). It is never
+// destroyed: its device and pinned buffers go with the process, after the optional report.
+namespace {
+FlashNextExpertCache* g_expert_cache = nullptr;
+} // namespace
+
+FlashNextExpertCache* flash_next_expert_cache() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_FLASH_NEXT_OFFLOAD");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    if (!enabled) { return nullptr; }
+    if (g_expert_cache == nullptr) {
+        g_expert_cache = new FlashNextExpertCache();
+        if (g_expert_cache->policy().report) {
+            std::atexit([] { g_expert_cache->report(); });
+        }
+    }
+    return g_expert_cache;
+}
 
 std::size_t flash_next_moe_workspace_capacity_bytes(std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
@@ -85,6 +111,10 @@ void flash_next_moe(const Tensor& input, const MoeWeights& weights, Tensor& outp
         throw std::runtime_error("Flash-Next Volta expert banks must use matching residency");
     }
     if (weights.expert_gate_up.mapped_host) {
+        if (auto* cache = flash_next_expert_cache(); cache != nullptr) {
+            cache->run(input, weights, scratch, output, stream, expert_staging, expert_staging_bytes);
+            return;
+        }
         std::vector<std::int32_t> host_ids(static_cast<std::size_t>(tokens) * 10);
         CUDA_CHECK(cudaMemcpyAsync(host_ids.data(), scratch.ids.data,
                                    static_cast<std::size_t>(tokens) * 10 * sizeof(std::int32_t),

@@ -395,3 +395,9 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
+ninfer_add_test(ninfer_qwen3_8_flash_next_expert_cpu_test
+  SOURCES targets/qwen3_8_flash_next/test_expert_cpu.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next)
+ninfer_add_op_test(ninfer_qwen3_8_flash_next_expert_cache_test
+  SOURCES targets/qwen3_8_flash_next/test_expert_cache.cpp
+  LIBRARIES ninfer_qwen3_8_flash_next)

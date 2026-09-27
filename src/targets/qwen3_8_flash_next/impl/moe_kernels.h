@@ -45,6 +45,9 @@ struct FlashNextMoeDownKernelAttributes {
 FlashNextMoeDownKernelAttributes
 flash_next_moe_down_kernel_attributes(FlashNextMoeDownKernel kernel);
 
+// output[2560, T] = bf16(output + cold): host-computed routed experts of a prefill-size call.
+void flash_next_moe_add_cold(Tensor& output, const float* cold, int tokens, cudaStream_t stream);
+
 void flash_next_moe_bf16_kernels_launch(const Tensor& input, const MoeBf16Weights& weights,
                                         const FlashNextMoeWorkspace& workspace, Tensor& output,
                                         cudaStream_t stream);

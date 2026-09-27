@@ -1,5 +1,7 @@
 add_library(ninfer_qwen3_8_flash_next STATIC
   impl/expert_bank.cpp
+  impl/expert_cache.cpp
+  impl/expert_cpu.cpp
   impl/frontend.cpp
   impl/gdn.cpp
   impl/gdn_kernels.cu

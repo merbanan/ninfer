@@ -33,6 +33,9 @@ struct FlashNextMoeWorkspace {
     Tensor down_act_scales;
     // Packed BF16 [1280, T] = gate[640,T] | shared-act[640,T] for the MMA shared path.
     Tensor shared_gemm;
+    // Decode arm only: FP32 [2560, T] routed-expert sum computed on the host for experts the
+    // offload cache does not hold (their ids point at an all-zero slot); added before rounding.
+    const float* cold_sum = nullptr;
 };
 
 template <class Arena>

@@ -291,7 +291,7 @@ __global__ void flash_next_moe_down_kernel(
     const std::uint8_t* __restrict__ expert_codes, const std::uint8_t* __restrict__ expert_scales,
     const float* __restrict__ expert_divisors, std::uint64_t code_stride,
     std::uint64_t scale_stride, const __nv_bfloat16* __restrict__ shared_down,
-    __nv_bfloat16* __restrict__ output) {
+    const float* __restrict__ cold_sum, __nv_bfloat16* __restrict__ output) {
     const int token = static_cast<int>(blockIdx.y);
     const int tid   = static_cast<int>(threadIdx.x);
     const int warp  = tid >> 5;
@@ -320,6 +320,7 @@ __global__ void flash_next_moe_down_kernel(
     const float shared_value = down_shared_path_value(shared_down, token_activations, row, lane);
 
     if (lane == 0) {
+        if (cold_sum != nullptr) { routed += cold_sum[static_cast<std::int64_t>(token) * kHidden + row]; }
         output[static_cast<std::int64_t>(token) * kHidden + row] =
             __float2bfloat16_rn(fmaf(shared_scale[token], shared_value, routed));
     }
@@ -348,7 +349,7 @@ void flash_next_moe_down_pathwarp_kernel(
     const std::uint8_t* __restrict__ expert_codes, const std::uint8_t* __restrict__ expert_scales,
     const float* __restrict__ expert_divisors, std::uint64_t code_stride,
     std::uint64_t scale_stride, const __nv_bfloat16* __restrict__ shared_down,
-    __nv_bfloat16* __restrict__ output) {
+    const float* __restrict__ cold_sum, __nv_bfloat16* __restrict__ output) {
     // Lane-0 value of each warp's warp_reduce_sum, indexed by path (10 = shared expert).
     __shared__ float s_path[kPaths];
     // alpha[0..9] and shared_scale of this token, staged by warp 10 so that thread 0's combine
@@ -391,6 +392,7 @@ void flash_next_moe_down_pathwarp_kernel(
         for (int path = 0; path < kTopK; ++path) {
             routed = fmaf(s_coef[path], s_path[path], routed);
         }
+        if (cold_sum != nullptr) { routed += cold_sum[static_cast<std::int64_t>(token) * kHidden + row]; }
         output[static_cast<std::int64_t>(token) * kHidden + row] =
             __float2bfloat16_rn(fmaf(s_coef[kTopK], s_path[kTopK], routed));
     }
@@ -1832,12 +1834,12 @@ void launch_down_decode(FlashNextMoeDownKernel kernel, const MoeWeights& weights
         const dim3 down_grid(kHidden / kDownWarps, static_cast<unsigned>(tokens));
         flash_next_moe_down_kernel<<<down_grid, kDownWarps * 32, 0, stream>>>(
             ids, alpha, shared_scale, activations, codes, scales, divisors, code_stride,
-            scale_stride, shared_down, out);
+            scale_stride, shared_down, workspace.cold_sum, out);
     } else {
         const dim3 down_grid(kHidden, static_cast<unsigned>(tokens));
         flash_next_moe_down_pathwarp_kernel<<<down_grid, kDownPathThreads, 0, stream>>>(
             ids, alpha, shared_scale, activations, codes, scales, divisors, code_stride,
-            scale_stride, shared_down, out);
+            scale_stride, shared_down, workspace.cold_sum, out);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1871,6 +1873,21 @@ FlashNextMoeDownKernel flash_next_moe_down_kernel_selection() {
         return legacy ? FlashNextMoeDownKernel::Legacy : FlashNextMoeDownKernel::PathWarp;
     }();
     return selection;
+}
+
+namespace {
+__global__ void flash_next_moe_add_cold_kernel(__nv_bfloat16* __restrict__ output,
+                                               const float* __restrict__ cold, std::int64_t count) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) { output[i] = __float2bfloat16_rn(__bfloat162float(output[i]) + cold[i]); }
+}
+} // namespace
+
+void flash_next_moe_add_cold(Tensor& output, const float* cold, int tokens, cudaStream_t stream) {
+    const std::int64_t count = static_cast<std::int64_t>(tokens) * kHidden;
+    flash_next_moe_add_cold_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(output.data), cold, count);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void flash_next_moe_down_launch(FlashNextMoeDownKernel kernel, const MoeWeights& weights,
