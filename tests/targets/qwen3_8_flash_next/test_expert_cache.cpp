@@ -6,6 +6,9 @@
 #include "core/device.h"
 #include "targets/qwen3_8_flash_next/impl/expert_cache.h"
 #include "targets/qwen3_8_flash_next/impl/moe.h"
+#include "targets/qwen3_8_flash_next/impl/moe_kernels.h"
+#include "targets/qwen3_8_flash_next/impl/moe_route.h"
+#include "targets/qwen3_8_flash_next/impl/moe_workspace.h"
 
 #include <cuda_runtime.h>
 
@@ -133,7 +136,7 @@ int main() {
         bank->mapped_payload_bytes = 1;
     }
 
-    constexpr int kMaxTokens = 64;
+    constexpr int kMaxTokens = 1024;
     DeviceArena workspace(flash_next_moe_workspace_capacity_bytes(1, kMaxTokens) + (1U << 20));
     DeviceArena io((static_cast<std::size_t>(kHidden) * kMaxTokens * 2 + 4096) * 3);
     cudaStream_t stream = nullptr;
@@ -198,6 +201,50 @@ int main() {
     const auto x64 = random_x(64);
     run(x64, 64, "prefill (uploads)", true);
     run(x64, 64, "prefill again (cached)", true);
+    // Optional timing of the device-resident MoE (NINFER_TEST_TIME_MOE=1).
+    if (const char* t = std::getenv("NINFER_TEST_TIME_MOE"); t != nullptr && t[0] == '1') {
+        for (int tokens : {1, 16, 64, 256, 1024}) {
+            io.reset();
+            const auto x = random_x(tokens);
+            Tensor input  = io.alloc(DType::BF16, {kHidden, tokens});
+            Tensor out    = io.alloc(DType::BF16, {kHidden, tokens});
+            CUDA_CHECK(cudaMemcpy(input.data, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+            cudaEvent_t a, b;
+            CUDA_CHECK(cudaEventCreate(&a));
+            CUDA_CHECK(cudaEventCreate(&b));
+            flash_next_moe(input, device_weights, out, workspace, stream);
+            CUDA_CHECK(cudaEventRecord(a, stream));
+            for (int i = 0; i < 10; ++i) { flash_next_moe(input, device_weights, out, workspace, stream); }
+            CUDA_CHECK(cudaEventRecord(b, stream));
+            CUDA_CHECK(cudaEventSynchronize(b));
+            float ms = 0.0F;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+            std::printf("device MoE T=%d: %.3f ms/call, %.1f us/token\n", tokens, ms / 10, ms * 100 / tokens);
+            const auto scope = workspace.scope();
+            FlashNextMoeWorkspace scratch = allocate_flash_next_moe_workspace(workspace, tokens);
+            const auto time = [&](const char* what, auto&& body) {
+                body();
+                CUDA_CHECK(cudaEventRecord(a, stream));
+                for (int i = 0; i < 10; ++i) { body(); }
+                CUDA_CHECK(cudaEventRecord(b, stream));
+                CUDA_CHECK(cudaEventSynchronize(b));
+                float t = 0.0F;
+                CUDA_CHECK(cudaEventElapsedTime(&t, a, b));
+                std::printf("  %-10s %.1f us\n", what, t * 100);
+            };
+            time("route", [&] {
+                flash_next_route(input, device_weights.router, device_weights.shared_gate_weight, scratch.scores,
+                                 scratch.ids, scratch.alpha, scratch.shared_scale, stream);
+            });
+            time("experts", [&] { flash_next_moe_kernels_launch(input, device_weights, scratch, out, stream); });
+            if (tokens <= 8) {
+                time("down", [&] {
+                    flash_next_moe_down_launch(flash_next_moe_down_kernel_selection(), device_weights, scratch, tokens,
+                                               out, stream);
+                });
+            }
+        }
+    }
     flash_next_expert_cache()->report();
     std::printf(failures == 0 ? "PASS\n" : "FAIL\n");
     return failures == 0 ? 0 : 1;

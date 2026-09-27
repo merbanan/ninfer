@@ -1887,6 +1887,14 @@ __global__ void flash_next_moe_add_cold_kernel(__nv_bfloat16* __restrict__ outpu
 }
 } // namespace
 
+bool flash_next_moe_prefill_simt_only() noexcept {
+#if defined(NINFER_VOLTA_BUILD)
+    return true;
+#else
+    return false;
+#endif
+}
+
 void flash_next_moe_add_cold(Tensor& output, const float* cold, int tokens, cudaStream_t stream) {
     const std::int64_t count = static_cast<std::int64_t>(tokens) * kHidden;
     flash_next_moe_add_cold_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(

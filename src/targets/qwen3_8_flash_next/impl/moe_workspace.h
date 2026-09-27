@@ -41,6 +41,10 @@ struct FlashNextMoeWorkspace {
     const std::int32_t* expert_slots = nullptr;
 };
 
+// True when prefill always takes the SIMT arm (the sm_70 build, which lacks the NVFP4 MMA
+// route); its FP32 routed intermediate is then carved at every token count.
+[[nodiscard]] bool flash_next_moe_prefill_simt_only() noexcept;
+
 template <class Arena>
 FlashNextMoeWorkspace allocate_flash_next_moe_workspace(Arena& arena, std::int32_t tokens) {
     FlashNextMoeWorkspace out;
@@ -60,7 +64,7 @@ FlashNextMoeWorkspace allocate_flash_next_moe_workspace(Arena& arena, std::int32
         out.grouped_paths     = arena.alloc(DType::I32, {10 * tokens}, 16);
         out.grouped_experts   = arena.alloc(DType::I32, {10 * tokens}, 16);
         out.token_to_pos      = arena.alloc(DType::I32, {10 * tokens}, 16);
-        if (tokens >= 512) {
+        if (tokens >= 512 && !flash_next_moe_prefill_simt_only()) {
             // MMA arm: BF16 staged routed outputs [2560, 10 * tokens], reduced in fixed order.
             // The envelope is computed by calling this with the chunk capacity, but a tail chunk
             // of 9..511 tokens takes the SIMT arm and carves an FP32 [2560, 10, T] intermediate,
