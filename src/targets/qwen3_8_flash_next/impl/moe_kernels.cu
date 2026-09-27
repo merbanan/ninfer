@@ -1902,6 +1902,28 @@ void flash_next_moe_add_cold(Tensor& output, const float* cold, int tokens, cuda
     CUDA_CHECK(cudaGetLastError());
 }
 
+void flash_next_moe_gate_up_decode_launch(const Tensor& input, const MoeWeights& weights,
+                                          const FlashNextMoeWorkspace& workspace, int tokens,
+                                          cudaStream_t stream) {
+    if (tokens < 1 || tokens > 8) {
+        throw std::invalid_argument("Flash-Next MoE decode gate/up launch requires 1 <= tokens <= 8");
+    }
+    const dim3 gate_grid(kIntermediate / GateSchedule::kWarpsPerCta,
+                         static_cast<unsigned>(tokens), kPaths);
+    flash_next_moe_gate_up_kernel<<<gate_grid, GateSchedule::kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input.data),
+        static_cast<const std::int32_t*>(workspace.ids.data),
+        reinterpret_cast<const std::uint8_t*>(weights.expert_gate_up.codes),
+        reinterpret_cast<const std::uint8_t*>(weights.expert_gate_up.scales),
+        weights.expert_gate_up.weight_scale_divisors,
+        weights.expert_gate_up.code_bytes_per_expert,
+        weights.expert_gate_up.scale_bytes_per_expert,
+        static_cast<const __nv_bfloat16*>(weights.shared_gate.qdata),
+        static_cast<const __nv_bfloat16*>(weights.shared_up.qdata),
+        static_cast<__nv_bfloat16*>(workspace.activations.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void flash_next_moe_down_launch(FlashNextMoeDownKernel kernel, const MoeWeights& weights,
                                 const FlashNextMoeWorkspace& workspace, int tokens,
                                 Tensor& output, cudaStream_t stream) {
@@ -1927,21 +1949,7 @@ void flash_next_moe_kernels_launch(const Tensor& input, const MoeWeights& weight
 
     if (tokens <= 8) {
         // Decode path (tokens <= 8): UNTOUCHED fused kernels
-        const dim3 gate_grid(kIntermediate / GateSchedule::kWarpsPerCta,
-                             static_cast<unsigned>(tokens), kPaths);
-        flash_next_moe_gate_up_kernel<<<gate_grid, GateSchedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(input.data),
-            static_cast<const std::int32_t*>(workspace.ids.data),
-            reinterpret_cast<const std::uint8_t*>(weights.expert_gate_up.codes),
-            reinterpret_cast<const std::uint8_t*>(weights.expert_gate_up.scales),
-            weights.expert_gate_up.weight_scale_divisors,
-            weights.expert_gate_up.code_bytes_per_expert,
-            weights.expert_gate_up.scale_bytes_per_expert,
-            static_cast<const __nv_bfloat16*>(weights.shared_gate.qdata),
-            static_cast<const __nv_bfloat16*>(weights.shared_up.qdata),
-            static_cast<__nv_bfloat16*>(workspace.activations.data));
-        CUDA_CHECK(cudaGetLastError());
-
+        flash_next_moe_gate_up_decode_launch(input, weights, workspace, tokens, stream);
         // Path-per-warp by default; NINFER_FLASH_NEXT_MOE_DOWN_LEGACY=1 pins the legacy kernel.
         launch_down_decode(flash_next_moe_down_kernel_selection(), weights, workspace, tokens,
                            output, stream);

@@ -342,6 +342,14 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
         ids[i] = slot >= 0 ? slot : static_cast<std::int32_t>(slots_);
     }
     CUDA_CHECK(cudaMemcpyAsync(scratch.ids.data, ids, n * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+    MoeWeights cached     = weights;
+    cached.expert_gate_up = make_nvfp4_expert_bank_view(gate_pool_.p, gate_.total, static_cast<std::int32_t>(slots_ + 1),
+                                                        2 * kIntermediate, kHidden);
+    cached.expert_down    = make_nvfp4_expert_bank_view(down_pool_.p, down_.total, static_cast<std::int32_t>(slots_ + 1),
+                                                        kHidden, kIntermediate);
+    // Gate/up runs on the device while the host computes the missing experts; the down kernel
+    // then adds their sum before rounding.
+    flash_next_moe_gate_up_decode_launch(input, cached, scratch, tokens, stream);
     scratch.cold_sum = nullptr;
     if (!cold.empty()) {
         const auto start = std::chrono::steady_clock::now();
@@ -352,12 +360,7 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
                                    cudaMemcpyHostToDevice, stream));
         scratch.cold_sum = static_cast<const float*>(device_cold_.p);
     }
-    MoeWeights cached     = weights;
-    cached.expert_gate_up = make_nvfp4_expert_bank_view(gate_pool_.p, gate_.total, static_cast<std::int32_t>(slots_ + 1),
-                                                        2 * kIntermediate, kHidden);
-    cached.expert_down    = make_nvfp4_expert_bank_view(down_pool_.p, down_.total, static_cast<std::int32_t>(slots_ + 1),
-                                                        kHidden, kIntermediate);
-    flash_next_moe_kernels_launch(input, cached, scratch, output, stream);
+    flash_next_moe_down_launch(flash_next_moe_down_kernel_selection(), cached, scratch, tokens, output, stream);
     scratch.cold_sum = nullptr;
 
     // Background promotions of the most frequently missed experts.

@@ -33,6 +33,13 @@ void flash_next_moe_down_launch(FlashNextMoeDownKernel kernel, const MoeWeights&
                                 const FlashNextMoeWorkspace& workspace, int tokens,
                                 Tensor& output, cudaStream_t stream);
 
+// Decode-arm (tokens <= 8) gate/up with the shared expert into workspace.activations; with
+// flash_next_moe_down_launch it is the decode arm of flash_next_moe_kernels_launch, split so a
+// caller can work between the two (the expert cache computes host experts there).
+void flash_next_moe_gate_up_decode_launch(const Tensor& input, const MoeWeights& weights,
+                                          const FlashNextMoeWorkspace& workspace, int tokens,
+                                          cudaStream_t stream);
+
 // Compiled/launch attributes of a decode-arm down kernel, for the occupancy report in the test
 // (PathWarp is designed for 4 resident CTAs per SM at 352 threads x 40 registers, no spills).
 struct FlashNextMoeDownKernelAttributes {
