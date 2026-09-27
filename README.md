@@ -113,6 +113,22 @@ ninfer qwen3_6_35b_a3b.v2.ninfer --offload-experts --max-context 8192 --prompt "
 
 Details and measurements: [V100 port](docs/v100.md#qwen36-35b-a3b-with-experts-in-host-memory).
 
+## Qwen3.8-Flash-Next on an 8 GB GPU (experts in host memory)
+
+The sm_70 build also runs Qwen3.8-Flash-Next (68 GB of NVFP4 experts) on 8 GB Volta/Turing
+cards. The experts stay in the file mapping behind a device expert cache, and misses are computed
+on the CPU or uploaded. On an RTX 2060 SUPER with a Ryzen 9 3900X and 60 GB of RAM it decodes at
+about 6 tok/s and prefills at 25-36 tok/s. It is bound by host memory: most experts come from NVMe
+through the page cache.
+
+```bash
+ninfer qwen3_8_flash_next_mixed.ninfer --max-context 32768 --kv-dtype fp8 --prefill-chunk 2048 \
+  --prompt "Hello"
+```
+
+Details, routing analysis and memory projections:
+[V100 port](docs/v100.md#qwen38-flash-next-with-experts-in-host-memory).
+
 ## Quick start
 
 NInfer requires 64-bit Linux, a Tesla V100 with CUDA Toolkit 12.8, CMake 3.28 or newer, a C++20
