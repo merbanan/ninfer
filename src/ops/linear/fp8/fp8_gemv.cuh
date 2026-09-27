@@ -6,6 +6,7 @@
 // owning BF16 row multiplier. Output owns the physical row mapping so fused projections reuse the
 // same weight/decode mainloop without materializing a packed parent output.
 
+#include "ops/common/fp8_e4m3_decode.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -16,7 +17,6 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
-#include "ops/common/fp8_e4m3_decode.cuh"
 
 namespace ninfer::ops::detail {
 

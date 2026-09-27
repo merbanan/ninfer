@@ -3,13 +3,13 @@
 // E4M3FN row-scaled D256 KV-cache codec shared by standalone append and causal Attention.
 // Persistent scales cross one FP16 represented-value boundary before codes are formed.
 
+#include "ops/common/fp8_e4m3_decode.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 #include <cstdint>
-#include "ops/common/fp8_e4m3_decode.cuh"
 
 namespace ninfer::ops {
 

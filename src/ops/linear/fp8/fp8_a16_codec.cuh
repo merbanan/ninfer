@@ -2,12 +2,13 @@
 
 // Exact E4M3-to-BF16 operand widening shared by the small-T and GEMM A16 routes.
 
+#include "ops/common/fp8_e4m3_decode.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 #include <cstdint>
-#include "ops/common/fp8_e4m3_decode.cuh"
 
 namespace ninfer::ops::detail {
 

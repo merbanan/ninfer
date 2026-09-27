@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "ninfer/ops/selected_block_attention.h"
+#include "ops/common/fp8_e4m3_decode.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
@@ -52,10 +53,13 @@ template <>
 struct VectorKV<__nv_fp8_e4m3> {
     __device__ __forceinline__ static void load_8(const __nv_fp8_e4m3* ptr, int lane_id, float out[8]) {
         const uint2 vec = *reinterpret_cast<const uint2*>(reinterpret_cast<const char*>(ptr) + lane_id * 8);
-        const auto* fp8 = reinterpret_cast<const __nv_fp8_e4m3*>(&vec);
+        const std::uint32_t words[2] = {vec.x, vec.y};
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            out[i] = static_cast<float>(fp8[i]);
+        for (int i = 0; i < 4; ++i) {
+            const float2 pair = __half22float2(
+                ops::fp8_e4m3x2_to_half2(static_cast<std::uint16_t>(words[i / 2] >> (16 * (i % 2)))));
+            out[2 * i]     = pair.x;
+            out[2 * i + 1] = pair.y;
         }
     }
 };
@@ -68,11 +72,13 @@ __device__ __forceinline__ void stage_kv_vector(
     } else {
         if (valid) {
             const unsigned long long raw = *reinterpret_cast<const unsigned long long*>(src);
-            const auto* fp8 = reinterpret_cast<const __nv_fp8_e4m3*>(&raw);
             __nv_bfloat16 bf16_vals[8];
             #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                bf16_vals[i] = __float2bfloat16_rn(static_cast<float>(fp8[i]));
+            for (int i = 0; i < 4; ++i) {
+                const float2 pair = __half22float2(
+                    ops::fp8_e4m3x2_to_half2(static_cast<std::uint16_t>(raw >> (16 * i))));
+                bf16_vals[2 * i]     = __float2bfloat16_rn(pair.x);
+                bf16_vals[2 * i + 1] = __float2bfloat16_rn(pair.y);
             }
             *reinterpret_cast<float4*>(dst) = *reinterpret_cast<float4*>(bf16_vals);
         } else {
