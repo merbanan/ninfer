@@ -16,6 +16,7 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
+#include "ops/common/fp8_e4m3_decode.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -66,9 +67,7 @@ __device__ __forceinline__ Fp8CodePack<Values> load_fp8_codes(const std::uint8_t
 }
 
 __device__ __forceinline__ float2 decode_fp8_e4m3x2(std::uint16_t storage) {
-    __nv_fp8x2_e4m3 value;
-    value.__x = storage;
-    return static_cast<float2>(value);
+    return __half22float2(fp8_e4m3x2_to_half2(storage));
 }
 
 template <int Values, int Rows, int AccumulatorChains>

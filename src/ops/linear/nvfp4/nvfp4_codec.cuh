@@ -4,6 +4,7 @@
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
@@ -11,16 +12,41 @@
 
 namespace ninfer::ops::detail {
 
+// Before native FP4/FP8 conversions (sm_89 for E4M3, sm_100 for E2M1) the cuda_fp4/cuda_fp8
+// casts are long generic software sequences that made the NVFP4 GEMV kernels ALU-bound on
+// Volta/Turing. Both formats embed exactly in FP16: exponent and mantissa bits placed at the top
+// of the FP16 exponent/mantissa fields give the value times 2^-(15 - bias) for normal and
+// subnormal encodings alike, so a bit shuffle, the FP16 -> FP32 conversion and an exact
+// power-of-two multiply decode them bit for bit.
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+    const std::uint32_t s    = storage;
+    const std::uint32_t bits = ((s & 0x07U) << 9) | ((s & 0x08U) << 12) | ((s & 0x70U) << 21) |
+                               ((s & 0x80U) << 24);
+    __half2_raw raw;
+    raw.x = static_cast<unsigned short>(bits);
+    raw.y = static_cast<unsigned short>(bits >> 16);
+    const float2 value = __half22float2(__half2(raw));
+    return make_float2(value.x * 16384.0F, value.y * 16384.0F);
+#else
     __nv_fp4x2_e2m1 value;
     value.__x = storage;
     return static_cast<float2>(value);
+#endif
 }
 
 __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    // 0x7F/0xFF (NaN) are not produced by the quantizers and are not handled here.
+    const std::uint32_t s = storage;
+    __half_raw raw;
+    raw.x = static_cast<unsigned short>(((s & 0x7FU) << 7) | ((s & 0x80U) << 8));
+    return __half2float(__half(raw)) * 256.0F;
+#else
     __nv_fp8x2_e4m3 value;
     value.__x = static_cast<std::uint16_t>(storage) | (static_cast<std::uint16_t>(storage) << 8);
     return static_cast<float2>(value).x;
+#endif
 }
 
 struct alignas(8) Nvfp4QuantizedK16 {

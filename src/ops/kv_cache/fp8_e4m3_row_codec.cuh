@@ -9,6 +9,7 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
+#include "ops/common/fp8_e4m3_decode.cuh"
 
 namespace ninfer::ops {
 
@@ -68,9 +69,7 @@ __device__ __forceinline__ std::uint16_t kv_cache_fp8_quant_code2(float x0, floa
 }
 
 __device__ __forceinline__ __half2 kv_cache_fp8_code2_to_half2(std::uint16_t storage) {
-    __nv_fp8x2_e4m3 value;
-    value.__x = storage;
-    return static_cast<__half2>(value);
+    return fp8_e4m3x2_to_half2(storage);
 }
 
 __device__ __forceinline__ __half2 kv_cache_fp8_dequant_code2_to_half2(std::uint16_t storage,

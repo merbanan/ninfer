@@ -7,6 +7,7 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
+#include "ops/common/fp8_e4m3_decode.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -16,9 +17,7 @@ union Fp8A16PairBits {
 };
 
 __device__ __forceinline__ unsigned fp8_e4m3x2_to_bf16x2_bits(unsigned packed) {
-    __nv_fp8x2_e4m3 fp8;
-    fp8.__x                 = static_cast<std::uint16_t>(packed);
-    const __half2 half_pair = static_cast<__half2>(fp8);
+    const __half2 half_pair = fp8_e4m3x2_to_half2(static_cast<std::uint16_t>(packed));
     Fp8A16PairBits result;
     result.pair = __halves2bfloat162(__nv_bfloat16(__low2half(half_pair)),
                                      __nv_bfloat16(__high2half(half_pair)));
