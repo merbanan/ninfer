@@ -12,6 +12,9 @@
 #include <stdexcept>
 #include <thread>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 namespace ninfer::targets::qwen3_8_flash_next::detail {
 namespace {
 
@@ -71,7 +74,8 @@ FlashNextOffloadPolicy FlashNextOffloadPolicy::from_environment() {
         out.host_us_per_expert = std::strtod(value, &end);
         if (end != nullptr && *end == ',') { out.host_us_per_column = std::strtod(end + 1, nullptr); }
     }
-    out.report = env_u32("NINFER_FLASH_NEXT_OFFLOAD_STATS", 0) != 0;
+    out.will_need = env_u32("NINFER_FLASH_NEXT_WILLNEED", out.will_need ? 1 : 0) != 0;
+    out.report    = env_u32("NINFER_FLASH_NEXT_OFFLOAD_STATS", 0) != 0;
     return out;
 }
 
@@ -177,6 +181,23 @@ int FlashNextExpertCache::layer_of(const MoeWeights& weights) {
         layer_calls_.resize(layers_.size(), 0);
     }
     return it->second;
+}
+
+void FlashNextExpertCache::will_need(const MoeWeights& weights, std::span<const std::int32_t> experts) const {
+    if (!policy_.will_need) { return; }
+    static const std::uintptr_t page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    const auto advise = [](const std::byte* begin, std::size_t bytes) {
+        const auto first = reinterpret_cast<std::uintptr_t>(begin) & ~(page - 1);
+        const auto last  = reinterpret_cast<std::uintptr_t>(begin) + bytes;
+        (void)madvise(reinterpret_cast<void*>(first), last - first, MADV_WILLNEED);
+    };
+    for (const std::int32_t e : experts) {
+        for (const auto* bank : {&weights.expert_gate_up, &weights.expert_down}) {
+            advise(bank->codes + static_cast<std::size_t>(e) * bank->code_bytes_per_expert, bank->code_bytes_per_expert);
+            advise(bank->scales + static_cast<std::size_t>(e) * bank->scale_bytes_per_expert,
+                   bank->scale_bytes_per_expert);
+        }
+    }
 }
 
 void FlashNextExpertCache::pack(const MoeWeights& weights, std::span<const std::int32_t> experts, std::byte* dst) {
@@ -341,6 +362,13 @@ void FlashNextExpertCache::decode(int layer, const Tensor& input, const MoeWeigh
         }
         ids[i] = slot >= 0 ? slot : static_cast<std::int32_t>(slots_);
     }
+    if (!cold.empty()) {
+        std::vector<std::int32_t> cold_experts;
+        for (std::size_t i = 0; i < experts.size(); ++i) {
+            if (slot_of_expert[i] < 0) { cold_experts.push_back(experts[i]); }
+        }
+        will_need(weights, cold_experts);
+    }
     CUDA_CHECK(cudaMemcpyAsync(scratch.ids.data, ids, n * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
     MoeWeights cached     = weights;
     cached.expert_gate_up = make_nvfp4_expert_bank_view(gate_pool_.p, gate_.total, static_cast<std::int32_t>(slots_ + 1),
@@ -490,6 +518,8 @@ void FlashNextExpertCache::prefill(int layer, const Tensor& input, const MoeWeig
     stats_.cold += host_count;
     stats_.uploads += missing.size() - host_count;
     if (host_count > 0) { ++stats_.hybrid_calls; }
+    // Every expert this call reads from the mapping, host and uploads alike, requested at once.
+    will_need(weights, missing);
 
     // Host experts need the input and route weights; fetched while the stream is idle.
     std::uint16_t* x = nullptr;

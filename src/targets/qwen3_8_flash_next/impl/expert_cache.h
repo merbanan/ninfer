@@ -40,6 +40,9 @@ struct FlashNextOffloadPolicy {
     double pack_us_per_expert      = 250.0;
     double host_us_per_expert      = 125.0;
     double host_us_per_column      = 22.0;
+    // Ask the kernel to read in (MADV_WILLNEED) every expert a call takes from the mapping before
+    // touching it, so page-cache misses reach the disk as one deep queue instead of fault by fault.
+    bool will_need = true;
     // Host threads (the caller included); 0 = one per physical core.
     std::uint32_t host_threads = 0;
     bool report                = false;
@@ -47,7 +50,7 @@ struct FlashNextOffloadPolicy {
     // NINFER_FLASH_NEXT_CACHE_MB, NINFER_FLASH_NEXT_CACHE_RESERVE_MB, NINFER_FLASH_NEXT_HOST_TOKENS,
     // NINFER_FLASH_NEXT_PROMOTE, NINFER_FLASH_NEXT_ADMIT,
     // NINFER_FLASH_NEXT_CPU_THREADS, NINFER_FLASH_NEXT_HYBRID, NINFER_FLASH_NEXT_HOST_US
-    // ("<per expert>,<per column>"), NINFER_FLASH_NEXT_OFFLOAD_STATS.
+    // ("<per expert>,<per column>"), NINFER_FLASH_NEXT_WILLNEED, NINFER_FLASH_NEXT_OFFLOAD_STATS.
     [[nodiscard]] static FlashNextOffloadPolicy from_environment();
 };
 
@@ -120,6 +123,7 @@ private:
     // Copies `experts` of both host banks into `dst`, packed_bytes() apart (gate codes, scales,
     // divisor, down codes, scales, divisor, each 256-aligned), on the host pool.
     void pack(const MoeWeights& weights, std::span<const std::int32_t> experts, std::byte* dst);
+    void will_need(const MoeWeights& weights, std::span<const std::int32_t> experts) const;
     // Forgets the expert held by `slot` (the slot stays allocated to the caller).
     void evict(std::uint32_t slot);
     [[nodiscard]] std::size_t packed_bytes() const noexcept;
