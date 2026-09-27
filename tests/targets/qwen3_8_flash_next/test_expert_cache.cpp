@@ -10,6 +10,7 @@
 #include "targets/qwen3_8_flash_next/impl/moe_prefill_turing.h"
 #include "targets/qwen3_8_flash_next/impl/moe_route.h"
 #include "targets/qwen3_8_flash_next/impl/moe_workspace.h"
+#include "targets/qwen3_8_flash_next/impl/stage_ledger.h"
 
 #include <cuda_runtime.h>
 
@@ -250,6 +251,14 @@ int main() {
                 CUDA_CHECK(cudaMemcpyAsync(turing.data(), out.data, turing.size() * 2, cudaMemcpyDeviceToHost, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 time("turing", [&] { flash_next_moe_kernels_launch(input, device_weights, scratch, out, stream); });
+                if (FlashNextStageLedger::is_enabled()) {
+                    FlashNextStageLedger::instance().begin_chunk(stream, tokens);
+                    flash_next_route(input, device_weights.router, device_weights.shared_gate_weight, scratch.scores,
+                                     scratch.ids, scratch.alpha, scratch.shared_scale, stream);
+                    stage_ledger_record(stream, FlashNextStageId::MoE_Router);
+                    flash_next_moe_kernels_launch(input, device_weights, scratch, out, stream);
+                    FlashNextStageLedger::instance().finish_chunk(stream);
+                }
                 double max_ref = 0.0, max_err = 0.0, sum_err = 0.0;
                 for (std::size_t i = 0; i < simt.size(); ++i) {
                     const double r = from_bf16(simt[i]);
