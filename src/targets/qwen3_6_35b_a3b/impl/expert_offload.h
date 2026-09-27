@@ -64,13 +64,18 @@ struct ExpertOffloadPolicy {
     // 8 GiB beside them. Uploads are then direct DMA from that copy instead of a CPU copy into a
     // staging buffer first, which halved host expert throughput while uploads ran beside it.
     bool pin_host_experts = true;
+    // Lossy: routed columns computed on the host whose route weight is below this are dropped
+    // (their contribution is left out; an expert left with no columns is not computed), after
+    // Lucebox's miss dropping. 0 disables. Device-resident experts are never affected.
+    float drop_weight = 0.0F;
     double upload_gbps              = 6.5;
     double host_us_per_expert       = 60.0;
     double host_us_per_column       = 12.0;
 
     // Defaults, overridden by NINFER_OFFLOAD_COLD, NINFER_OFFLOAD_PROMOTE, NINFER_OFFLOAD_CPU_THREADS,
     // NINFER_OFFLOAD_ADMIT, NINFER_OFFLOAD_PREFETCH, NINFER_OFFLOAD_HYBRID, NINFER_OFFLOAD_UPLOAD_GBPS,
-    // NINFER_OFFLOAD_HOST_US ("<per expert>,<per column>"), NINFER_OFFLOAD_PIN.
+    // NINFER_OFFLOAD_HOST_US ("<per expert>,<per column>"), NINFER_OFFLOAD_PIN,
+    // NINFER_OFFLOAD_DROP_WEIGHT.
     [[nodiscard]] static ExpertOffloadPolicy from_environment();
 };
 
@@ -80,6 +85,7 @@ struct ExpertOffloadStats {
     std::uint64_t hits          = 0; // resident on the device
     std::uint64_t cold          = 0; // computed on the host
     std::uint64_t cold_columns  = 0; // routed columns of the host-computed experts
+    std::uint64_t dropped_columns = 0; // host columns left out by drop_weight
     std::uint64_t uploads       = 0; // uploaded before use (prefill-size calls)
     std::uint64_t promotions    = 0; // uploaded in the background
     std::uint64_t prefetched    = 0; // uploaded ahead of their layer during prefill

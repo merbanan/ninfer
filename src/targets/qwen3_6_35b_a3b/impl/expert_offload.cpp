@@ -141,6 +141,9 @@ ExpertOffloadPolicy ExpertOffloadPolicy::from_environment() {
     out.prefetch_min_tokens = env_u32("NINFER_OFFLOAD_PREFETCH", out.prefetch_min_tokens);
     out.hybrid_max_tokens   = env_u32("NINFER_OFFLOAD_HYBRID", out.hybrid_max_tokens);
     out.pin_host_experts    = env_u32("NINFER_OFFLOAD_PIN", out.pin_host_experts ? 1 : 0) != 0;
+    if (const char* value = std::getenv("NINFER_OFFLOAD_DROP_WEIGHT"); value != nullptr && value[0] != '\0') {
+        out.drop_weight = std::max(0.0F, std::strtof(value, nullptr));
+    }
     if (const char* value = std::getenv("NINFER_OFFLOAD_UPLOAD_GBPS"); value != nullptr && value[0] != '\0') {
         out.upload_gbps = std::max(0.1, std::strtod(value, nullptr));
     }
@@ -366,6 +369,11 @@ ExpertOffload::~ExpertOffload() {
                      stats_.upload_seconds, stats_.host_compute_seconds,
                      static_cast<unsigned long long>(stats_.cold_columns),
                      static_cast<unsigned long long>(stats_.hybrid_calls), stats_.upload_wait_seconds);
+        if (stats_.dropped_columns > 0) {
+            std::fprintf(stderr, "[qwen3.6-35b-a3b expert offload] dropped %llu low-weight host columns (weight < %g)\n",
+                         static_cast<unsigned long long>(stats_.dropped_columns),
+                         static_cast<double>(policy_.drop_weight));
+        }
         if (stats_.prefill_moe_seconds > 0) {
             std::fprintf(stderr, "[qwen3.6-35b-a3b expert offload] prefill MoE wall time %.2f s\n",
                          stats_.prefill_moe_seconds);
@@ -934,6 +942,10 @@ void ExpertOffload::cold_compute(std::size_t layer, std::span<const std::int32_t
     for (std::size_t i = 0; i < selected.size(); ++i) {
         const std::int32_t expert = selected[i];
         if (bank_of_expert[expert] != -1) { continue; }
+        if (alpha[i] < policy_.drop_weight) {
+            ++stats_.dropped_columns;
+            continue;
+        }
         if (work_of_expert[expert] < 0) {
             work_of_expert[expert] = static_cast<std::int32_t>(work.size());
             work.push_back({host_view(layer, expert), {}, {}});
